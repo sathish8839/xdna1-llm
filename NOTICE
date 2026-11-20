@@ -1,0 +1,14 @@
+xdna1-llm
+Copyright 2026 The xdna1-llm contributors
+
+This product includes software developed as part of this project, licensed under the Apache License 2.0.
+
+NPU kernels are built from the mlir-aie project's programming examples
+(https://github.com/Xilinx/mlir-aie), Copyright Advanced Micro Devices, Inc.,
+licensed under the Apache License v2.0 with LLVM Exceptions. No mlir-aie source is redistributed here;
+kernels/build_kernels.sh builds them from a user-supplied checkout.
+
+The XRT runtime and its Python bindings (pyxrt) are not redistributed; users obtain them from
+https://github.com/Xilinx/XRT.
+
+Model weights (e.g. LiquidAI LFM3) are not redistributed and remain under their own licenses.

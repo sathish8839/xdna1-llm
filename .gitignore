@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# Kernel build outputs and local tools (rebuild with kernels/build_kernels.sh)
+kernels/build/
+kernels/.bin/
+*.xclbin
+insts*.bin
+
+# Vendor binaries and models: never commit
+*.pyd
+*.dll
+*.zip
+*.gguf
+*.safetensors
+
+# Benchmark outputs
+power_*.csv
+*_results*.json
+bench_*.json

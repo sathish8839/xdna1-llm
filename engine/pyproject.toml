@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xdna1-llm"
+version = "0.1.0.dev0"
+description = "Run LLMs entirely on first-generation AMD XDNA (Ryzen 7040/8040/200, npu1) NPUs"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.13,<3.14"  # pyxrt from the XRT Windows SDK is built for CPython 3.13
+authors = [{ name = "xdna1-llm contributors" }]
+keywords = ["npu", "xdna", "amd", "ryzen-ai", "llm", "inference", "gguf"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Operating System :: Microsoft :: Windows :: Windows 11",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["numpy>=2.0", "gguf>=0.10", "ml_dtypes>=0.4"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+xdna1-llm = "xdna1_llm.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["npu: needs an XDNA1 NPU, pyxrt and built kernels (skipped otherwise)"]

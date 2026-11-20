@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# xclbinutil shim for WSL: runs the Windows XRT SDK's xclbinutil.exe, translating Linux paths to Windows (UNC) paths.
+# JSON section files (e.g. AIE_PARTITION) embed absolute Linux paths to PDIs, so they are rewritten too.
+# Install: copy as `xclbinutil` somewhere on PATH and set XRT_SDK_WIN to the SDK's xrt dir as seen from WSL, e.g.
+#   export XRT_SDK_WIN=/mnt/c/Users/<you>/xrt_sdk/xrt
+set -uo pipefail
+EXE="${XRT_SDK_WIN:?set XRT_SDK_WIN to the Windows XRT SDK xrt/ directory}/xclbinutil.exe"
+TMPD=$(mktemp -d)
+
+fixjson() {  # copy a JSON file with every absolute Linux path string rewritten to a Windows path
+  local dst="$TMPD/$(basename "$1")"
+  python3 - "$1" "$dst" <<'PY'
+import json, subprocess, sys
+def win(p): return subprocess.check_output(["wslpath", "-w", p]).decode().strip()
+def walk(o):
+    if isinstance(o, dict): return {k: walk(v) for k, v in o.items()}
+    if isinstance(o, list): return [walk(v) for v in o]
+    if isinstance(o, str) and o.startswith("/"): return win(o)
+    return o
+json.dump(walk(json.load(open(sys.argv[1]))), open(sys.argv[2], "w"), indent=2)
+PY
+  echo "$dst"
+}
+
+args=()
+for a in "$@"; do
+  if [[ "$a" != -* && "$a" == *:*:* ]]; then  # SECTION:FORMAT:PATH
+    pre="${a%:*}"; last="${a##*:}"
+    if [[ "$last" == *.json && -f "$last" ]]; then
+      args+=("$pre:$(wslpath -w "$(fixjson "$(realpath "$last")")")"); continue
+    fi
+    if [[ "$last" == /* || -e "$last" || "$last" == */* ]]; then
+      args+=("$pre:$(wslpath -w "$(realpath -m "$last")")"); continue
+    fi
+  fi
+  if [[ "$a" != -* && ( "$a" == /* || -e "$a" || "$a" == */* ) ]]; then
+    if [[ "$a" == *.json && -f "$a" ]]; then
+      args+=("$(wslpath -w "$(fixjson "$(realpath "$a")")")"); continue
+    fi
+    args+=("$(wslpath -w "$(realpath -m "$a")")"); continue
+  fi
+  args+=("$a")
+done
+exec "$EXE" "${args[@]}"

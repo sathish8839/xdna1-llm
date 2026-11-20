@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/ruff-action@v3
+      - uses: astral-sh/ruff-action@v3
+        with:
+          args: format --check
+
+  test:
+    # CPU only: tests marked `npu` skip themselves without pyxrt. On-device testing happens on contributors'
+    # machines (see the hardware report issue template).
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv venv --python 3.13 .venv
+      - run: uv pip install --python .venv/Scripts/python.exe -e ".[dev]"
+      - run: .venv/Scripts/python.exe -m pytest -rs
