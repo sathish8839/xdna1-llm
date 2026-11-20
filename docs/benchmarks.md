@@ -41,29 +41,39 @@ Everything below was measured on a Ryzen 7 250 (XDNA1, "NPU Phoenix"), Windows 1
 
 ## 3b. Decode GEMV (M = 1)
 
-`kernels/designs/stream_bw.py` streams host memory into cores with no compute. `kernels/designs/gemv.py` is a bf16
-GEMV with fp32 output: 8 lanes (two shim channels per column, cores in rows 2–3), each lane owning N/8 rows, and
-the activation sent on the same lane as one tile ahead of the weights. Medians of 50 runs, including dispatch.
+`kernels/designs/stream_bw.py` streams host memory into cores with no compute. `kernels/designs/gemv.py` (bf16) and
+`kernels/designs/q4gemv.py` (4-bit) are the decode GEMVs: 8 lanes (two shim channels per column, cores in rows
+2–3), each lane owning N/8 rows, with the activation and the tile count sent on the same lane ahead of the
+weights. Because the cores read the tile count from the data, one xclbin per K serves every N; only the
+instruction stream changes. Medians of 50 runs, including dispatch, all sizes of a K in one hardware context.
 
 | Streaming only (16 MB) | 1 lane | 2 lanes | 4 lanes | 8 lanes |
 |---|---|---|---|---|
 | GB/s | 6.4 | 11.5 | 19.3 | **23.5** |
 
-| GEMV shape (N×K) | Weights | Time | Weight stream | Max rel. error vs numpy |
-|---|---|---|---|---|
-| k+v 1024×2048 | 4 MB | 0.33 ms | 12.8 GB/s | 1.7e-7 |
-| q / o / conv-out 2048×2048 | 8 MB | 0.49 ms | 17.3 GB/s | 2.0e-7 |
-| conv in_proj 6144×2048 | 24 MB | 1.10 ms | 22.9 GB/s | 1.9e-7 |
-| FFN gate+up 15360×2048 | 60 MB | 2.24 ms | **28.1 GB/s** | 1.8e-7 |
-| FFN down 2048×7680 | 30 MB | 1.42 ms | 22.1 GB/s | 2.2e-7 |
+| Shape (N×K) | bf16: time | bf16: stream | 4-bit: bytes | 4-bit: time | 4-bit: weights/s |
+|---|---|---|---|---|---|
+| k+v 1024×2048 | 0.30 ms | 14.0 GB/s | 1.2 MB | 0.23 ms | 9.0 G/s |
+| q / o / conv-out 2048×2048 | 0.44 ms | 19.3 GB/s | 2.5 MB | 0.28 ms | 15.1 G/s |
+| conv in_proj 6144×2048 | 1.05 ms | 24.1 GB/s | 7.5 MB | 0.47 ms | 26.6 G/s |
+| FFN gate+up 15360×2048 | 2.23 ms | 28.2 GB/s | 18.8 MB | **0.90 ms** | **35.1 G/s** |
+| FFN down 2048×7680 | 1.16 ms | 27.1 GB/s | — | — | — |
 
-* 3× the GEMM design's decode bandwidth, with the compute (16-lane bf16 MACs, 4 accumulators) keeping up.
+* bf16 matches numpy to ~2e-7; the 4-bit kernel matches an fp32 dequantization to ~2e-5.
+* Switching instruction streams inside one context costs nothing: alternating 2048- and 15360-row calls takes
+  exactly the average of the two.
+* 4-bit layout: q in 0..15 with one bf16 (scale, min) per row per 32 weights, as GGUF Q4_K after expanding its
+  6-bit scales (5 bits per weight; Q4_K itself is 4.5). Nibbles become bf16 exactly via the exponent trick
+  (`0x4300 | q` = 128 + q) and the offset is removed per group. AIE2 emulates fp32 multiplies, so the per-group
+  scaling uses native bf16 MACs with each factor split into a high and a low bf16 part: that change alone took
+  the kernel from 17.5 to 35 G weights/s.
+* The 4-bit kernel is still compute-bound (22 GB/s at the largest shape vs. 28 GB/s for bf16 streaming), so
+  there is headroom left. FFN down (K = 7680) and the LM head need K split across tiles and are not built yet.
 * Each call carries ~0.15–0.2 ms of fixed cost, which is why small shapes reach less. Fusing calls per layer
   removes most of it.
-* bf16 LFM3-1.7B decode with these kernels, one call per projection: about 120 ms of projections plus ~19 ms of
-  LM head per token, so ~7 tok/s. Q4_K_M moves ~3× fewer bytes, so the same bandwidth would allow ~20 tok/s if
-  the 4-bit unpacking keeps up (not yet measured).
-* Every shape is its own xclbin here. The engine needs one design sized at run time to stay within 5 contexts.
+* Estimated LFM3-1.7B 4-bit decode at these rates, one call per projection: ~10 ms conv layers, ~9 ms attention
+  projections, ~35 ms FFN (down estimated), ~8 ms LM head, so ~60 ms or **~16 tok/s** before fusing. bf16 with
+  the same scheme is ~7 tok/s. Not yet measured end to end.
 
 ## 4. LFM3-1.7B prefill with linears on the NPU
 

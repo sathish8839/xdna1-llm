@@ -60,20 +60,28 @@ class Kernel:
         npu.dev.register_xclbin(xb)
         self.ctx = xrt.hw_context(npu.dev, xb.get_uuid())
         self.kernel = xrt.kernel(self.ctx, xb.get_kernels()[0].get_name())
-        self.insts = np.fromfile(insts_path, dtype=np.uint32)
-        self.bo_instr = npu.bo(self.insts.nbytes, self.kernel.group_id(1), cacheable=True)
-        self.bo_instr.write(self.insts.tobytes(), 0)
-        self.bo_instr.sync(TO_DEV)
+        self.programs: dict[str, tuple] = {}
+        self.add_program("default", insts_path)
+
+    def add_program(self, name: str, insts_path: str):
+        """Register another instruction stream (host-side DMA program) for this context. Designs whose core
+        programs do not depend on a size (e.g. the decode GEMV's N) run every size this way, in one context."""
+        insts = np.fromfile(insts_path, dtype=np.uint32)
+        bo = self.npu.bo(insts.nbytes, self.kernel.group_id(1), cacheable=True)
+        bo.write(insts.tobytes(), 0)
+        bo.sync(TO_DEV)
+        self.programs[name] = (bo, len(insts))
 
     def group(self, arg_index: int) -> int:
         """Group id for the i-th data buffer (0-based) of an mlir-aie runtime sequence."""
         return self.kernel.group_id(3 + arg_index)
 
-    def start(self, *bos):
-        return self.kernel(3, self.bo_instr, len(self.insts), *bos)
+    def start(self, *bos, program: str = "default"):
+        bo_instr, n = self.programs[program]
+        return self.kernel(3, bo_instr, n, *bos)
 
-    def run(self, *bos):
-        st = self.start(*bos).wait()
+    def run(self, *bos, program: str = "default"):
+        st = self.start(*bos, program=program).wait()
         if st != COMPLETED:
             raise RuntimeError(f"{self.tag}: {st}")
 

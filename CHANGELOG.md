@@ -14,5 +14,8 @@ All notable changes to this project are documented here. The format follows
 - `xdna1-llm` CLI with a `--compare` mode against llama.cpp.
 - Kernel build script for mlir-aie in WSL, plus shape, context-switch and power benchmarks.
 - CPU unit tests and on-device tests (`npu` marker), ruff and GitHub Actions CI.
-- Decode GEMV kernel (8 lanes, bf16, fp32 out): 17–28 GB/s weight streaming on LFM3 shapes, plus a
+- Decode GEMV kernel (8 lanes, bf16, fp32 out): 14–28 GB/s weight streaming on LFM3 shapes, plus a
   streaming-bandwidth probe and benchmarks.
+- One GEMV xclbin per K now serves every N: the tile count travels with the activation, and
+  `Kernel.add_program` switches instruction streams inside one context.
+- 4-bit GEMV (Q4_K-style scales and mins): up to 35 G weights/s for K = 2048, ~2e-5 from an fp32 reference.

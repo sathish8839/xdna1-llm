@@ -32,9 +32,9 @@ These come from measurements in [benchmarks.md](benchmarks.md):
 3. **64 KB data memory per compute tile**, 16 compute tiles (4×4), 4 memory tiles (512 KB each).
 4. **No native transcendental functions in AIE2 vectors**: softmax, SiLU and sigmoid need LUT or polynomial
    kernels (mlir-aie and IRON ship AIE2 versions).
-5. **Decode weight streaming:** ~9 GB/s with the GEMM design, **17–28 GB/s with the 8-lane GEMV**
-   ([benchmarks](benchmarks.md#3b-decode-gemv-m--1)). With 4-bit weights (~1 GB per token) that allows ~20 tok/s
-   if unpacking keeps up.
+5. **Decode weight streaming:** ~9 GB/s with the GEMM design, 14–28 GB/s with the 8-lane bf16 GEMV, and up to
+   35 G weights/s with the 4-bit GEMV ([benchmarks](benchmarks.md#3b-decode-gemv-m--1)), which puts 4-bit decode
+   at an estimated ~16 tok/s before fusing.
 
 ## M2: tokenizer and generation
 
@@ -45,8 +45,10 @@ These come from measurements in [benchmarks.md](benchmarks.md):
 
 ## M3: decode on the NPU
 
-* **GEMV design** for M=1: done as a spike (`kernels/designs/gemv.py`), 8 lanes, 17–28 GB/s, exact against numpy.
-  Remaining: one design sized at run time (N per call) so all projections share a context, and fewer dispatches.
+* **GEMV design** for M=1: done (`kernels/designs/gemv.py`), 8 lanes, 14–28 GB/s, exact against numpy. One xclbin
+  per K serves every N through per-N instruction streams, so all projections of a K share one context.
+* **4-bit GEMV** (`kernels/designs/q4gemv.py`): working for K = 2048 at up to 35 G weights/s. Remaining: K split
+  across tiles (FFN down, LM head), repacking real Q4_K / Q6_K tensors from GGUF, fewer dispatches.
 * State in NPU-visible buffers across calls: the KV cache for the 11 attention layers (bf16, 4 KV heads × 128)
   and a 6-token rolling buffer for each of the 13 short-conv layers.
 
