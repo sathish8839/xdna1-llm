@@ -176,6 +176,9 @@ every linear weight made at load, and decodes on the GEMV from the state the pro
   as ~25 single-token steps.
 * The cost is the copy: 2.9 GB more RAM and ~25 s more load (dequantizing and uploading). A GEMM that reads the
   quantized tiles directly (roadmap M4, W4A16) would remove both.
+* The weight cache keeps both backends' device layouts on disk (3.9 GB for Q4_K_M). Loading Q4_K_M through
+  `Engine` with the GEMM: 38.0 s without the cache, 57.7 s the first time (writing it), 18.5 s after (12.4 s of
+  it in `Engine.load`), with identical greedy output.
 
 ## 4. LFM3-1.7B prefill with linears on the NPU
 

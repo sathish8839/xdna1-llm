@@ -1,0 +1,100 @@
+name: Release
+
+# Builds the NPU kernels and the installer. On a v* tag, attaches both to a draft GitHub release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  MLIR_AIE_COMMIT: 0f767004a478056b3f52496ac284d68b8b4535f4
+  XRT_SDK_URL: https://github.com/Xilinx/XRT/releases/download/2.21.75/xrt_windows_sdk.zip
+  XRT_SDK_SHA256: ccc244c2c423588972ade76142cdc01049477aaa39a35be97e782b97eb7c5295
+
+jobs:
+  kernels:
+    # mlir-aie compiles on Linux, but XRT ships no Linux xclbinutil: its calls are recorded here
+    # (kernels/xclbinutil-defer) and run with the Windows SDK's xclbinutil.exe in the next job.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: >
+          sudo apt-get update && sudo apt-get install -y build-essential clang clang-14 lld lld-14 cmake
+          ninja-build python3-venv python3-pip uuid-dev jq
+      - uses: actions/cache@v4
+        with:
+          path: ~/mlir-aie
+          key: mlir-aie-${{ env.MLIR_AIE_COMMIT }}
+      - name: mlir-aie (pinned commit, its prebuilt wheels)
+        run: |
+          if [ ! -d ~/mlir-aie/ironenv ]; then
+            git init -q ~/mlir-aie && cd ~/mlir-aie
+            git fetch -q --depth 1 https://github.com/Xilinx/mlir-aie.git "$MLIR_AIE_COMMIT"
+            git checkout -q FETCH_HEAD
+            bash -c 'set +u; source utils/env_install.sh'
+          fi
+      - name: Build kernels
+        run: |
+          for set in engine qgemv; do
+            MLIR_AIE=~/mlir-aie XCLBINUTIL_DEFER=calls ./kernels/build_kernels.sh kernels-out "$set" | tee -a build.log
+          done
+          if grep -q '^FAIL' build.log; then cat kernels-out/*.log; exit 1; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernels-deferred
+          path: |
+            kernels-out/
+            calls/
+
+  package:
+    needs: kernels
+    runs-on: windows-latest
+    permissions:
+      contents: write  # to attach the files to the release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernels-deferred
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - uses: astral-sh/setup-uv@v6
+      - name: XRT Windows SDK (xclbinutil.exe, pyxrt.pyd)
+        run: |
+          Invoke-WebRequest $env:XRT_SDK_URL -OutFile xrt_sdk.zip
+          if ((Get-FileHash -Algorithm SHA256 xrt_sdk.zip).Hash -ne $env:XRT_SDK_SHA256) { throw 'XRT SDK checksum mismatch' }
+          Expand-Archive xrt_sdk.zip xrt_sdk
+      - name: Package kernels
+        run: python kernels/package_xclbins.py calls kernels-out xrt_sdk/xrt_sdk/xrt/xclbinutil.exe
+      - name: Installer
+        run: |
+          if (-not (Get-Command ISCC.exe -ErrorAction SilentlyContinue) -and -not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup --no-progress -y
+          }
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME.TrimStart('v') } else { '' }
+          $opts = @{ Kernels = "$pwd\kernels-out"; Pyxrt = "$pwd\xrt_sdk\xrt_sdk\xrt\python\pyxrt.pyd" }
+          if ($version) { $opts.Version = $version }
+          ./installer/build-installer.ps1 @opts
+          Compress-Archive kernels-out/* dist/xdna1-llm-kernels.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: |
+            dist/xdna1-llm-setup-*.exe
+            dist/xdna1-llm-kernels.zip
+      - name: Attach to the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -ne 0) { gh release create $tag --draft --title $tag --notes 'See CHANGELOG.md.' }
+          gh release upload $tag (Get-Item dist/xdna1-llm-setup-*.exe).FullName dist/xdna1-llm-kernels.zip --clobber

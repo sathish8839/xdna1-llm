@@ -10,12 +10,14 @@ engine/src/xdna1_llm/
   cpu_linear.py      CpuLinear: the same interface in numpy, as a reference and fallback
   models/lfm3.py     LFM3: batched prefill and one-token decode over a shared state, on one or two linear backends
   gguf_weights.py    memory-mapped GGUF tensors (BF16, F32)
+  weight_cache.py    the NPU backends' converted weights on disk, so a later load skips converting them
   bf16.py            float32 <-> bf16 bit conversion
   tokenizer.py       byte-level BPE from the GGUF (Llama 3 pre-tokenizer), identical to llama.cpp
   chat.py            LFM3's chat template (thinking, tools) in Python
   sampling.py        next-token choice: greedy, or temperature / top-k / top-p / min-p / repetition penalty
   reference.py       llama-server client: the optional ground truth for tests and benchmarks
-  engine.py          one chat turn: template, prompt, sampling; splits reasoning, content and tool calls
+  engine.py          one chat turn: template, prompt, sampling; splits reasoning, content and tool calls;
+                     resumes from the last turn's state, so a follow-up only runs the tokens that are new
   server.py          OpenAI-compatible HTTP server (standard library), one turn at a time on the NPU
   cli.py             run a prompt or chat message on the NPU and/or CPU, optionally against llama.cpp
 app/                 WinUI 3 chat app (C#, unpackaged, Windows App SDK copied next to the exe)

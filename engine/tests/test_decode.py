@@ -107,3 +107,25 @@ def test_chunked_prefill_then_decode_matches_step_by_step(monkeypatch):
     assert st.pos == ref_st.pos == len(ids) and set(prefill_lin.mats) == set(m.lin.mats) - {"lm_head"}
     for t in (5, 9, 2):  # decoding continues from the prefilled state
         np.testing.assert_allclose(m.step(t, st), m.step(t, ref_st), rtol=1e-4, atol=1e-5)
+
+
+def test_rewind_to_a_snapshot_matches_a_fresh_prefill(monkeypatch):
+    from xdna1_llm.models import lfm3
+
+    monkeypatch.setattr(lfm3, "CHUNK", 4)  # snapshots at the end of every chunk: 4, 8, 10
+    m = LFM3(TinyLfm3Weights(seed=5), CpuLinear())
+    m.window = 3
+    ids = list(np.random.default_rng(6).integers(0, 50, size=10))
+    st = m.new_state(max_len=32)
+    m.forward(ids, st)
+    for t in (1, 2, 3):  # decoded tokens, with no snapshot of their own
+        m.step(t, st)
+    assert st.rewind(13) == 13  # already there
+    assert st.rewind(9) == 8 and st.pos == 8  # the latest snapshot at or before 9
+    for prefix in (8, 0):
+        assert st.rewind(prefix) == prefix
+        more = [7, 7, 1, 4, 0, 9]
+        logits, _ = m.forward(more, st)
+        ref, _ = m.forward(ids[:prefix] + more)
+        np.testing.assert_allclose(logits, ref, rtol=1e-4, atol=1e-5)
+        np.testing.assert_allclose(m.step(5, st), m.forward(ids[:prefix] + more + [5])[0], rtol=1e-4, atol=1e-5)

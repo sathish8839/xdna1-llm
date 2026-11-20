@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import time
+from functools import partial
 
 import numpy as np
 
@@ -34,12 +35,14 @@ def _builds(kdir: str, geo: q4k.Geometry) -> list[str]:
 class NpuQLinear:
     wants_head = True
 
-    def __init__(self, npu: Npu | None = None, kernel_dir: str | None = None, formats: set[str] | None = None):
+    def __init__(
+        self, npu: Npu | None = None, kernel_dir: str | None = None, formats: set[str] | None = None, cache=None
+    ):
         """formats: the tensor types of the model (GGUFWeights.types()); an all-Q6_K model uses the q6only
-        geometry when it is built."""
+        geometry when it is built. cache: a WeightCache for the repacked weights, or None."""
         from .linear import default_kernel_dir
 
-        self.npu = npu or Npu()
+        self.npu, self.cache = npu or Npu(), cache
         self.kdir = kernel_dir or default_kernel_dir()
         quant = set(formats or ()) & set(FORMATS)
         q6only = quant == {"Q6_K"} and _builds(self.kdir, q4k.Q6ONLY)
@@ -62,7 +65,7 @@ class NpuQLinear:
             else:
                 groups.append((kind, [data]))
         mats = []
-        for kind, datas in groups:
+        for g, (kind, datas) in enumerate(groups):
             fmt, mod = FORMATS[kind]
             raw = np.concatenate(datas, axis=0) if len(datas) > 1 else datas[0]
             N, K = raw.shape[0], raw.shape[1] // mod.BLOCK_BYTES * mod.QK
@@ -75,7 +78,8 @@ class NpuQLinear:
                     raise FileNotFoundError(f"{name}: no instruction stream {insts} (kernels/build_kernels.sh)")
                 self.kern.add_program(prog, insts)
             t0 = time.perf_counter()
-            tiles = mod.repack(raw, self.geo)
+            make = partial(mod.repack, raw, self.geo)
+            tiles = self.cache.get(f"gemv-{self.geo.name}/{name}.{g}", make) if self.cache else make()
             self.repack_s += time.perf_counter() - t0
             bo_w = self.npu.bo(tiles.nbytes, self.kern.group(0))
             bo_w.write(tiles.tobytes(), 0)

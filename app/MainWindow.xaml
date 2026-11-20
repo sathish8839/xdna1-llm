@@ -28,8 +28,12 @@
                      Fill="{ThemeResource TextFillColorDisabledBrush}" />
             <TextBlock x:Name="StatusText" Grid.Column="1" VerticalAlignment="Center"
                        TextTrimming="CharacterEllipsis" Text="Starting…" />
-            <Button x:Name="ModelButton" Grid.Column="2" Content="Model…" Click="OnChooseModel"
-                    ToolTipService.ToolTip="Choose the GGUF model file" />
+            <Button x:Name="ModelButton" Grid.Column="2" Content="Model…"
+                    ToolTipService.ToolTip="Download a model or choose a GGUF file">
+                <Button.Flyout>
+                    <MenuFlyout x:Name="ModelMenu" Placement="BottomEdgeAlignedRight" Opening="OnModelMenuOpening" />
+                </Button.Flyout>
+            </Button>
             <Button Grid.Column="3" Content="New chat" Click="OnNewChat" />
         </Grid>
 
@@ -42,6 +46,27 @@
                    MaxWidth="420" TextAlignment="Center" TextWrapping="Wrap"
                    Foreground="{ThemeResource TextFillColorTertiaryBrush}"
                    Text="LFM3 runs on this PC's NPU. Nothing leaves the machine unless you turn on web search." />
+
+        <!-- First run: no model yet. -->
+        <StackPanel x:Name="SetupPanel" Grid.Row="2" Width="520" HorizontalAlignment="Center" VerticalAlignment="Center"
+                    Spacing="12" Visibility="Collapsed">
+            <TextBlock Style="{StaticResource SubtitleTextBlockStyle}" Text="Get a model" />
+            <TextBlock TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                       Text="xdna1 chat runs LiquidAI's LFM3-1.7B on this PC's NPU. Download it once from Hugging Face; after that, everything stays on this machine." />
+            <StackPanel x:Name="ModelChoices" Spacing="8" />
+            <TextBlock TextWrapping="Wrap" FontSize="12" Foreground="{ThemeResource TextFillColorTertiaryBrush}">
+                LFM3 is made by Liquid AI and licensed under the
+                <Hyperlink NavigateUri="https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/blob/main/LICENSE">LFM Open License v1.0</Hyperlink>.
+            </TextBlock>
+            <ProgressBar x:Name="DownloadBar" Maximum="1" Visibility="Collapsed" />
+            <Grid x:Name="DownloadRow" Visibility="Collapsed">
+                <TextBlock x:Name="DownloadText" VerticalAlignment="Center"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                <Button x:Name="CancelDownloadButton" HorizontalAlignment="Right" Content="Cancel"
+                        Visibility="Collapsed" Click="OnCancelDownload" />
+            </Grid>
+            <HyperlinkButton Padding="0" Content="Or use a GGUF file you already have…" Click="OnChooseModel" />
+        </StackPanel>
 
         <!-- Composer -->
         <Grid Grid.Row="3" MaxWidth="860" Padding="24,4,24,20" RowSpacing="8">

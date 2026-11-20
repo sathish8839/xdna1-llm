@@ -25,6 +25,7 @@ public sealed partial class MainWindow : Window
     private ChatClient? client;
     private CancellationTokenSource? starting;
     private CancellationTokenSource? turn;
+    private CancellationTokenSource? downloading;
     private string ready = "";
 
     public MainWindow()
@@ -35,8 +36,10 @@ public sealed partial class MainWindow : Window
         SetTitleBar(StatusText);
         ThinkToggle.IsChecked = settings.Thinking;
         SearchToggle.IsChecked = settings.WebSearch;
+        BuildModelChoices();
         Closed += (_, _) =>
         {
+            downloading?.Cancel();
             starting?.Cancel();
             turn?.Cancel();
             engine.Dispose();
@@ -60,9 +63,11 @@ public sealed partial class MainWindow : Window
         }
         if (string.IsNullOrEmpty(settings.Gguf) || !File.Exists(settings.Gguf))
         {
-            SetStatus(Status.Idle, "Choose a model file to start: LFM3-1.7B Q4_K_M (faster) or Q6_K (closer to full quality)");
+            ShowSetup(true);
+            if (downloading == null) SetStatus(Status.Idle, "Get a model to start");
             return;
         }
+        ShowSetup(false);
 
         SetStatus(Status.Loading, $"Loading {Path.GetFileNameWithoutExtension(settings.Gguf)} onto the NPU… (about a minute)");
         var sw = Stopwatch.StartNew();
@@ -294,12 +299,128 @@ public sealed partial class MainWindow : Window
         await StartEngineAsync();
     }
 
+    private void BuildModelChoices()
+    {
+        foreach (var m in ModelDownload.Models)
+        {
+            var row = new Grid { ColumnSpacing = 12 };
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            var text = new StackPanel { Spacing = 2 };
+            text.Children.Add(new TextBlock { Text = m.Name, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold });
+            text.Children.Add(new TextBlock
+            {
+                Text = m.Note,
+                FontSize = 12,
+                Foreground = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"],
+            });
+            var size = new TextBlock { Text = ModelDownload.Gb(m.Size), VerticalAlignment = VerticalAlignment.Center };
+            Grid.SetColumn(size, 1);
+            row.Children.Add(text);
+            row.Children.Add(size);
+            var button = new Button
+            {
+                Content = row,
+                HorizontalAlignment = HorizontalAlignment.Stretch,
+                HorizontalContentAlignment = HorizontalAlignment.Stretch,
+                Padding = new Thickness(14, 10, 14, 10),
+            };
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(button, $"Download {m.Name}");
+            button.Click += (_, _) => _ = DownloadModelAsync(m);
+            ModelChoices.Children.Add(button);
+        }
+    }
+
+    private void OnModelMenuOpening(object sender, object e)
+    {
+        ModelMenu.Items.Clear();
+        if (downloading != null)
+        {
+            var cancel = new MenuFlyoutItem { Text = "Cancel download" };
+            cancel.Click += OnCancelDownload;
+            ModelMenu.Items.Add(cancel);
+            ModelMenu.Items.Add(new MenuFlyoutSeparator());
+        }
+        foreach (var m in ModelDownload.Models)
+        {
+            bool have = ModelDownload.IsDownloaded(m);
+            bool current = string.Equals(settings.Gguf, ModelDownload.LocalPath(m), StringComparison.OrdinalIgnoreCase);
+            var item = new MenuFlyoutItem
+            {
+                Text = current ? $"{m.Name} (in use)" : have ? $"Use {m.Name}" : $"Download {m.Name} ({ModelDownload.Gb(m.Size)})",
+                IsEnabled = !current && downloading == null,
+            };
+            item.Click += (_, _) => _ = DownloadModelAsync(m);
+            ModelMenu.Items.Add(item);
+        }
+        ModelMenu.Items.Add(new MenuFlyoutSeparator());
+        var file = new MenuFlyoutItem { Text = "Choose a GGUF file…" };
+        file.Click += OnChooseModel;
+        ModelMenu.Items.Add(file);
+    }
+
+    /// <summary>Downloads the model (or finds it downloaded), then loads it.</summary>
+    private async Task DownloadModelAsync(ModelInfo m)
+    {
+        if (downloading != null) return;
+        var cts = downloading = new CancellationTokenSource();
+        ModelChoices.Visibility = Visibility.Collapsed;
+        DownloadBar.Visibility = CancelDownloadButton.Visibility = DownloadRow.Visibility = Visibility.Visible;
+        DownloadBar.Value = 0;
+        DownloadText.Text = $"Downloading {m.Name}…";
+        var progress = new Progress<DownloadProgress>(p =>
+        {
+            DownloadBar.Value = (double)p.Done / p.Total;
+            var rate = p.BytesPerSecond > 0 ? $" · {p.BytesPerSecond / 1e6:0} MB/s" : "";
+            DownloadText.Text = $"{p.Done / 1e6:N0} of {p.Total / 1e6:N0} MB{rate}";
+            if (SetupPanel.Visibility != Visibility.Visible)
+                SetStatus(Status.Loading, $"Downloading {m.Name}: {p.Done * 100 / p.Total}%{rate}");
+        });
+        string? path = null;
+        try
+        {
+            path = await ModelDownload.DownloadAsync(m, progress, cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            DownloadText.Text = "Download cancelled. Starting again resumes it.";
+            if (client != null) SetStatus(Status.Ready, ready);
+        }
+        catch (Exception e) when (e is HttpRequestException or IOException or InvalidDataException or UnauthorizedAccessException)
+        {
+            DownloadText.Text = "";
+            SetStatus(Status.Error, "The download failed", e.Message);
+        }
+        finally
+        {
+            downloading = null;
+            cts.Dispose();
+            ModelChoices.Visibility = Visibility.Visible;
+            DownloadBar.Visibility = CancelDownloadButton.Visibility = Visibility.Collapsed;
+            if (path != null) DownloadText.Text = "";
+            DownloadRow.Visibility = DownloadText.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+        }
+        if (path == null) return;
+        settings.Gguf = path;
+        settings.Save();
+        turn?.Cancel();
+        await StartEngineAsync();
+    }
+
+    private void OnCancelDownload(object sender, RoutedEventArgs e) => downloading?.Cancel();
+
+    private void ShowSetup(bool show)
+    {
+        SetupPanel.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
+        EmptyHint.Visibility = !show && Messages.Children.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+    }
+
     private void OnNewChat(object sender, RoutedEventArgs e)
     {
         turn?.Cancel();
         history.Clear();
         Messages.Children.Clear();
-        EmptyHint.Visibility = Visibility.Visible;
+        EmptyHint.Visibility = SetupPanel.Visibility == Visibility.Visible ? Visibility.Collapsed : Visibility.Visible;
         Input.Focus(FocusState.Programmatic);
     }
 

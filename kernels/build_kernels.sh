@@ -8,6 +8,8 @@
 #       shapes (per-shape GEMM benchmark kernels), smoke, all
 # Requires: an mlir-aie checkout with its ironenv (utils/env_install.sh) and xclbinutil on PATH
 # (on WSL use kernels/xclbinutil-wsl, which this script puts on PATH automatically).
+# With XCLBINUTIL_DEFER=<dir> (CI: Linux without XRT), xclbinutil calls are recorded there instead and the
+# .xclbin files are placeholders until kernels/package_xclbins.py runs them on Windows.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="$(realpath -m "${1:-$HERE/build}")"
@@ -15,8 +17,13 @@ SET="${2:-engine}"
 MLIR_AIE="${MLIR_AIE:-$HOME/mlir-aie}"
 mkdir -p "$OUT" "$HERE/.bin"
 
-# xclbinutil: prefer a native one, else the WSL shim
-if ! command -v xclbinutil >/dev/null; then
+# xclbinutil: the deferring stand-in if asked, else a native one, else the WSL shim
+if [[ -n "${XCLBINUTIL_DEFER:-}" ]]; then
+  mkdir -p "$XCLBINUTIL_DEFER"
+  export XCLBINUTIL_DEFER="$(realpath "$XCLBINUTIL_DEFER")"
+  install -m 755 "$HERE/xclbinutil-defer" "$HERE/.bin/xclbinutil"
+  export PATH="$HERE/.bin:$PATH"
+elif ! command -v xclbinutil >/dev/null; then
   install -m 755 "$HERE/xclbinutil-wsl" "$HERE/.bin/xclbinutil"
   export PATH="$HERE/.bin:$PATH"
 fi

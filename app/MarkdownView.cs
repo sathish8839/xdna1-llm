@@ -34,7 +34,7 @@ public static class MarkdownView
     {
         HeadingBlock h => Text(h.Inline, h.Level switch { 1 => 22, 2 => 19, 3 => 17, _ => 15 }, bold: true),
         ParagraphBlock p => Text(p.Inline),
-        CodeBlock c => Code(c.Lines.ToString()),
+        CodeBlock c => Code(c.Lines.ToString(), (c as FencedCodeBlock)?.Info),
         ListBlock l => List(l, src),
         QuoteBlock q => Quote(q, src),
         ThematicBreakBlock => new Border { Height = 1, Margin = new Thickness(0, 6, 0, 6), Background = Brush("DividerStrokeColorDefaultBrush") },
@@ -110,24 +110,56 @@ public static class MarkdownView
         return h;
     }
 
-    private static UIElement Code(string code)
+    private static UIElement Code(string code, string? language)
     {
-        var text = new TextBlock { Text = code.TrimEnd('\n'), FontFamily = Mono, FontSize = 13, IsTextSelectionEnabled = true };
+        code = code.TrimEnd('\n');
+        var text = new TextBlock { Text = code, FontFamily = Mono, FontSize = 13, IsTextSelectionEnabled = true };
+        var header = new Grid { Margin = new Thickness(0, 0, 0, 4) };
+        header.Children.Add(new TextBlock
+        {
+            Text = language ?? "",
+            FontSize = 12,
+            Foreground = Brush("TextFillColorSecondaryBrush"),
+            VerticalAlignment = VerticalAlignment.Center,
+        });
+        var copy = new Button
+        {
+            Content = "Copy",
+            FontSize = 12,
+            Padding = new Thickness(8, 2, 8, 2),
+            Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
+            BorderThickness = new Thickness(0),
+            HorizontalAlignment = HorizontalAlignment.Right,
+        };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(copy, "Copy code");
+        copy.Click += async (_, _) =>
+        {
+            var data = new Windows.ApplicationModel.DataTransfer.DataPackage();
+            data.SetText(code);
+            Windows.ApplicationModel.DataTransfer.Clipboard.SetContent(data);
+            copy.Content = "Copied";
+            await Task.Delay(1500);
+            copy.Content = "Copy";
+        };
+        header.Children.Add(copy);
+        var body = new StackPanel();
+        body.Children.Add(header);
+        body.Children.Add(new ScrollViewer
+        {
+            Content = text,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollMode = ScrollMode.Auto,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            VerticalScrollMode = ScrollMode.Disabled,
+        });
         return new Border
         {
             Background = Brush("CardBackgroundFillColorSecondaryBrush"),
             BorderBrush = Brush("CardStrokeColorDefaultBrush"),
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(6),
-            Padding = new Thickness(12, 8, 12, 8),
-            Child = new ScrollViewer
-            {
-                Content = text,
-                HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
-                HorizontalScrollMode = ScrollMode.Auto,
-                VerticalScrollBarVisibility = ScrollBarVisibility.Disabled,
-                VerticalScrollMode = ScrollMode.Disabled,
-            },
+            Padding = new Thickness(12, 4, 6, 8),
+            Child = body,
         };
     }
 

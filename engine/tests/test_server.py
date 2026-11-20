@@ -35,23 +35,41 @@ class ScriptedModel:
     """Greedy decoding of this model yields `reply` token by token, whatever the prompt."""
 
     def __init__(self, reply: list[int], vocab: int):
-        self.reply, self.vocab, self.prompts = reply, vocab, []
+        self.reply, self.vocab, self.prompts, self.runs = reply, vocab, [], []
 
     def new_state(self, max_len):
-        return {"n": 0}
+        return ScriptedState()
 
     def _logits(self, st):
         x = np.zeros(self.vocab, np.float32)
-        x[self.reply[min(st["n"], len(self.reply) - 1)]] = 1.0
-        st["n"] += 1
+        x[self.reply[min(st.n, len(self.reply) - 1)]] = 1.0
+        st.n += 1
         return x
 
     def forward(self, ids, st):
-        self.prompts.append(list(ids))
+        st.toks += list(ids)
+        st.n = 0
+        self.prompts.append(list(st.toks))  # the whole prompt, including what the state already held
+        self.runs.append(len(ids))  # the tokens actually run
         return self._logits(st), []
 
     def step(self, t, st):
+        st.toks.append(t)
         return self._logits(st)
+
+
+class ScriptedState:
+    """Every position can be returned to."""
+
+    def __init__(self):
+        self.toks, self.n = [], 0
+
+    def snapshot(self):
+        pass
+
+    def rewind(self, pos):
+        del self.toks[pos:]
+        return len(self.toks)
 
 
 def engine(reply_text: str, **kw) -> Engine:
@@ -104,6 +122,39 @@ def test_tool_calls_are_parsed_with_schema_types():
     call = "<function=f>\n<parameter=n>\n7\n</parameter>\n<parameter=s>\n007\n</parameter>\n</function>"
     assert json.loads(parse_tool_call(call)["arguments"]) == {"n": 7, "s": "007"}  # not JSON: kept as text
     assert json.loads(parse_tool_call(call, {("f", "n"): "string"})["arguments"])["n"] == "7"
+
+
+def test_next_turn_runs_only_what_is_new():
+    from xdna1_llm import chat
+
+    eng = engine("Hello there!<|im_end|>")
+    first = [{"role": "user", "content": "Hi"}]
+    *_, done = eng.chat(first, thinking=False)
+    assert done.usage["prompt_tokens_details"]["cached_tokens"] == 0
+    second = first + [{"role": "assistant", "content": "Hello there!"}, {"role": "user", "content": "Bye"}]
+    *_, done = eng.chat(second, thinking=False)
+    want = eng.tok.encode(chat.render(second, enable_thinking=False))
+    cached = done.usage["prompt_tokens_details"]["cached_tokens"]
+    assert cached >= len(eng.tok.encode(chat.render(first, enable_thinking=False))) + len("Hello there!") - 1
+    assert eng.model.prompts[-1] == want and eng.model.runs[-1] == len(want) - cached
+
+    other = [{"role": "user", "content": "Hm"}]  # departs from the cached tokens early on
+    *_, done = eng.chat(other, thinking=False)
+    want = eng.tok.encode(chat.render(other, enable_thinking=False))
+    assert eng.model.prompts[-1] == want and 0 < done.usage["prompt_tokens_details"]["cached_tokens"] < len(want)
+
+
+def test_a_turn_stopped_early_can_still_be_resumed():
+    from xdna1_llm import chat
+
+    eng = engine("one two three<|im_end|>")
+    gen = eng.chat([{"role": "user", "content": "Hi"}], thinking=False)
+    next(e for e in gen if e.kind == "content")
+    gen.close()  # the client went away mid-reply
+    msgs = [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "o"}, {"role": "user", "content": "?"}]
+    *_, done = eng.chat(msgs, thinking=False)
+    assert eng.model.prompts[-1] == eng.tok.encode(chat.render(msgs, enable_thinking=False))
+    assert done.usage["prompt_tokens_details"]["cached_tokens"] > 0
 
 
 def test_stop_strings_and_length_limit():

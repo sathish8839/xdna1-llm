@@ -24,6 +24,7 @@ from .gguf_weights import GGUFWeights
 from .models.lfm3 import LFM3
 from .sampling import Sampler
 from .tokenizer import Tokenizer
+from .weight_cache import WeightCache
 
 
 @dataclass
@@ -35,18 +36,21 @@ class Event:
     usage: dict | None = None  # with "done": prompt_tokens, completion_tokens, total_tokens
 
 
+SNAPSHOT_EVERY = 32  # decoded tokens between conv snapshots: a later turn re-runs at most this many reply tokens
+
+
 class RequestError(ValueError):
     """The request cannot be served as given (HTTP 400)."""
 
 
-def gemm_backend(npu, kdir):
+def gemm_backend(npu, kdir, cache=None):
     """The bf16 GEMM for batched prompts, sharing the device; None (with a note) if its kernels are not built."""
     from .npu.linear import SUPPORTED_K, NpuLinear
 
     if not all(os.path.exists(os.path.join(kdir, f"gemm_256x{k}x1024_bf16_f32.xclbin")) for k in SUPPORTED_K):
         print(f"note: no bf16 GEMM kernels in {kdir} (kernels/build_kernels.sh <out> engine); prompt runs on the GEMV")
         return None
-    return NpuLinear(npu, kdir)
+    return NpuLinear(npu, kdir, cache=cache)
 
 
 class Engine:
@@ -58,16 +62,27 @@ class Engine:
         ids = tok.ids
         self.think_start, self.think_end = ids.get("<think>"), ids.get("</think>")
         self.call_start, self.call_end = ids.get("<tool_call>"), ids.get("</tool_call>")
+        self._cache = None  # (tokens, state) of the last turn, to reuse its shared prefix
 
     @classmethod
-    def load(cls, gguf: str, backend: str = "npu", kernels: str | None = None, gemm_prompt: bool = True, **kw):
+    def load(
+        cls,
+        gguf: str,
+        backend: str = "npu",
+        kernels: str | None = None,
+        gemm_prompt: bool = True,
+        weight_cache: bool = True,
+        **kw,
+    ):
+        """weight_cache: keep the NPU weight layouts on disk (xdna1_llm.weight_cache), so the next load is faster."""
         w = GGUFWeights(gguf)
         tok = Tokenizer.from_gguf(w)
         if backend == "npu":
             from .npu.qlinear import NpuQLinear  # imports pyxrt
 
-            lin = NpuQLinear(kernel_dir=kernels, formats=w.types())
-            model = LFM3(w, lin, gemm_backend(lin.npu, lin.kdir) if gemm_prompt else None)
+            cache = WeightCache.for_model(gguf) if weight_cache else None
+            lin = NpuQLinear(kernel_dir=kernels, formats=w.types(), cache=cache)
+            model = LFM3(w, lin, gemm_backend(lin.npu, lin.kdir, cache) if gemm_prompt else None)
             kw.setdefault("device", lin.npu.name)
         else:
             model = LFM3(w, CpuLinear())
@@ -100,8 +115,11 @@ class Engine:
         pick = self.sampler(**sampling)
         out = _Output(self, thinking, stop or [], _param_types(tools))
 
-        m, st = self.model, self.model.new_state(self.ctx)
-        logits, _ = m.forward(ids, st)
+        m = self.model
+        st, cached = self._resume(ids)
+        logits, _ = m.forward(ids[cached:], st)
+        fed = list(ids)  # the tokens in st, kept in step so the next turn can resume from them
+        self._cache = (fed, st)
         history, n, finish = list(ids), 0, "length"
         while n < limit:
             t = pick(logits, history)
@@ -114,13 +132,37 @@ class Engine:
             if out.stopped:
                 finish = "stop"
                 break
+            self._cache = None  # a step that fails halfway leaves the state unusable
             logits = m.step(t, st)
+            fed.append(t)
+            self._cache = (fed, st)
+            if len(fed) % SNAPSHOT_EVERY == 0:
+                st.snapshot()
         yield from out.flush()
         if out.calls:
             finish = "tool_calls"
             yield Event("tool_calls", tool_calls=out.calls)
-        usage = {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n}
+        usage = {
+            "prompt_tokens": len(ids),
+            "completion_tokens": n,
+            "total_tokens": len(ids) + n,
+            "prompt_tokens_details": {"cached_tokens": cached},
+        }
         yield Event("done", finish_reason=finish, usage=usage)
+
+    def _resume(self, ids: list[int]):
+        """A state to continue `ids` from: the last turn's, rewound to where `ids` departs from it (or to the
+        nearest snapshot before that), else a fresh one. Returns (state, number of ids already in it)."""
+        cache, self._cache = self._cache, None
+        if cache is None:
+            return self.model.new_state(self.ctx), 0
+        toks, st = cache
+        same = 0  # leaves at least one token to run: its logits pick the first reply token
+        for a, b in zip(toks, ids[:-1], strict=False):
+            if a != b:
+                break
+            same += 1
+        return st, st.rewind(same)
 
 
 class _Output:

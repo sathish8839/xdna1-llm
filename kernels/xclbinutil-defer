@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""xclbinutil stand-in for Linux builds without XRT (CI): records the call instead of running it.
+
+The Windows XRT SDK has xclbinutil.exe; XRT ships no Linux binary. So the kernels compile on Linux with this as
+`xclbinutil`, and kernels/package_xclbins.py runs the recorded calls on Windows. Each call gets its own folder
+under $XCLBINUTIL_DEFER with its input files (the JSON sections, and the PDIs those reference) and args.json. The
+--output file becomes a placeholder naming that folder; build scripts copy it like a real xclbin, and the packaging
+step replaces it wherever it ended up.
+"""
+
+import json
+import os
+import shutil
+import sys
+import uuid
+
+PLACEHOLDER = b"xdna1-llm deferred xclbin "
+
+
+def main(argv: list[str]) -> int:
+    root = os.environ.get("XCLBINUTIL_DEFER")
+    if not root:
+        print("xclbinutil-defer: set XCLBINUTIL_DEFER to the folder that collects the calls", file=sys.stderr)
+        return 2
+    if any(a in ("--version", "--help") for a in argv):
+        print("xclbinutil-defer (records calls for kernels/package_xclbins.py)")
+        return 0
+    call_id = uuid.uuid4().hex[:12]
+    call_dir = os.path.join(root, call_id)
+    os.makedirs(call_dir)
+    files: dict[str, str] = {}  # absolute source path -> name in call_dir
+
+    def keep(path: str) -> str:
+        path = os.path.abspath(path)
+        if path not in files:
+            files[path] = f"{len(files)}_{os.path.basename(path)}"
+            if path.endswith(".json"):
+                with open(path, encoding="utf-8") as f:
+                    data = rewrite(json.load(f))
+                with open(os.path.join(call_dir, files[path]), "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+            else:
+                shutil.copy2(path, os.path.join(call_dir, files[path]))
+        return "@@" + files[path]
+
+    def rewrite(o):  # absolute paths of existing files inside JSON sections (PDIs) -> kept copies
+        if isinstance(o, dict):
+            return {k: rewrite(v) for k, v in o.items()}
+        if isinstance(o, list):
+            return [rewrite(v) for v in o]
+        if isinstance(o, str) and o.startswith("/") and os.path.isfile(o):
+            return keep(o)
+        return o
+
+    args, output, i = [], None, 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--output" and i + 1 < len(argv):
+            output = argv[i + 1]
+            args += ["--output", "@@OUTPUT"]
+            i += 2
+            continue
+        if not a.startswith("-") and a.count(":") >= 2:  # SECTION:FORMAT:PATH
+            head, path = a.rsplit(":", 1)
+            args.append(f"{head}:{keep(path)}" if os.path.isfile(path) else a)
+        elif not a.startswith("-") and os.path.isfile(a):
+            args.append(keep(a))
+        else:
+            args.append(a)
+        i += 1
+    if output is None:
+        print("xclbinutil-defer: only calls that write an --output can be deferred", file=sys.stderr)
+        return 2
+    with open(os.path.join(call_dir, "args.json"), "w", encoding="utf-8") as f:
+        json.dump({"args": args, "cwd": os.getcwd(), "output": os.path.abspath(output)}, f, indent=2)
+    with open(output, "wb") as f:
+        f.write(PLACEHOLDER + call_id.encode() + b"\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

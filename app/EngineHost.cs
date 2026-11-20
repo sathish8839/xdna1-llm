@@ -77,7 +77,11 @@ public sealed class EngineHost : IDisposable
         {
             ct.ThrowIfCancellationRequested();
             if (proc.HasExited)
-                throw new InvalidOperationException($"the engine stopped (exit code {proc.ExitCode}):\n{LastLines()}");
+            {
+                proc.WaitForExit();  // lets the output readers catch up
+                throw new InvalidOperationException(
+                    ErrorLine() ?? $"the engine stopped (exit code {proc.ExitCode}):\n{LastLines()}");
+            }
             try
             {
                 var health = JsonNode.Parse(await http.GetStringAsync(BaseUrl + "/health", ct));
@@ -105,6 +109,13 @@ public sealed class EngineHost : IDisposable
     public string LastLines()
     {
         lock (tail) return string.Join("\n", tail);
+    }
+
+    /// <summary>The engine's own explanation of a failed start ("error: ..." on stderr), if it gave one.</summary>
+    private string? ErrorLine()
+    {
+        const string prefix = "error: ";
+        lock (tail) return tail.LastOrDefault(l => l.StartsWith(prefix))?[prefix.Length..];
     }
 
     private void Append(string? line)

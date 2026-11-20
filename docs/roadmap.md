@@ -14,7 +14,7 @@ tokenizes, schedules and samples.
 | M3 | Decode on the NPU: M=1 GEMV kernel, KV cache, short-conv state | ✅ |
 | M4 | **Q4_K_M** weights: Q4_K / Q6_K repacked at load and dequantized on the NPU | ✅ decode; W4A16 prefill open |
 | M5 | OpenAI-compatible server: `/v1/chat/completions` (SSE streaming, tool calls), `/v1/models` | ✅ |
-| M6 | **v0.1 release:** WinUI 3 app (chat, thinking toggle, DuckDuckGo web search) and an installer with prebuilt kernels | |
+| M6 | **v0.1 release:** WinUI 3 app (chat, thinking toggle, DuckDuckGo web search) and an installer with prebuilt kernels | ✅ app, installer; first CI release pending |
 | M7 | Every op on the NPU: fused per-layer designs (norms, conv, RoPE, attention, SwiGLU) | |
 | M8 | More context (chunked prefill beyond 256 tokens, up to 8K), more small models | |
 
@@ -102,11 +102,11 @@ GGUF Q4_K_M mixes **Q4_K** (most tensors) and **Q6_K** (for LFM3-1.7B: `token_em
   **web search** toggle. With search on, the app offers a `web_search` tool to the model, runs DuckDuckGo
   queries itself and returns the results as tool messages. The app starts and stops the engine and shows
   NPU status and speed.
-* **Installer (`installer/`, portable build done):** an embeddable Python 3.13 with the engine and pyxrt, prebuilt kernels, and the
+* **Installer (`installer/`, done):** an embeddable Python 3.13 with the engine and pyxrt, prebuilt kernels, and the
   app. On first run it downloads the model from Hugging Face. There is no WSL, no Python setup and no driver
   fiddling beyond the stock AMD NPU driver.
-* **CI-built kernels:** a GitHub Actions job builds the xclbins with mlir-aie on Linux and attaches them to
-  releases.
+* **CI-built kernels (workflow written, not yet run on GitHub):** a GitHub Actions job builds the xclbins with
+  mlir-aie on Linux, packages them on Windows, and attaches them and the installer to releases.
 
 ## M7: every op on the NPU
 

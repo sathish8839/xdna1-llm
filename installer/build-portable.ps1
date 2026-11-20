@@ -74,5 +74,10 @@ $kdir = New-Item -ItemType Directory -Force (Join-Path $Out 'kernels')
 Get-ChildItem $Kernels -File | Where-Object { $_.Extension -in '.xclbin', '.bin' -and $_.Name -notlike 'smoke_*' } |
     Copy-Item -Destination $kdir
 
+Write-Host '== notices'
+Copy-Item "$root\LICENSE", "$root\NOTICE" $Out
+$nuget = if ($env:NUGET_PACKAGES) { $env:NUGET_PACKAGES } else { "$env:USERPROFILE\.nuget\packages" }
+Invoke-Checked "$py\python.exe" @("$PSScriptRoot\notices.py", $Out, "$root\app\obj\project.assets.json", $nuget)
+
 $mb = [math]::Round((Get-ChildItem -Recurse -File $Out | Measure-Object Length -Sum).Sum / 1MB)
 Write-Host "== done: $Out ($mb MB)"

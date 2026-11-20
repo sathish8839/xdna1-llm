@@ -10,13 +10,18 @@ mlir-aie kernels take (opcode=3, instr_bo, instr_len, *buffers) with buffers on 
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
 
 import numpy as np
 
+from . import NpuError
+
 MAX_CONTEXTS = 5
+TESTED_DRIVERS = ("32.0.203.297",)  # Windows NPU driver versions the kernels are known to run on
+DRIVER_HELP = "https://github.com/sathish8839/xdna1-llm/blob/main/docs/setup.md#npu-driver"
 
 try:
     import pyxrt as xrt
@@ -35,8 +40,17 @@ class Npu:
     """One XRT device plus a registry of loaded kernels (one hw_context each)."""
 
     def __init__(self, index: int = 0):
-        self.dev = xrt.device(index)
+        try:
+            self.dev = xrt.device(index)
+        except Exception as e:
+            raise NpuError(
+                "No AMD NPU found. xdna1-llm needs a Ryzen 7040, 8040 or 200 series processor with AMD's NPU driver "
+                f"installed (Device Manager > Neural processors). See {DRIVER_HELP} ({e})"
+            ) from e
         self.name = self.dev.get_info(xrt.xrt_info_device.name)
+        self.driver = driver_version(self.dev)
+        if self.driver not in TESTED_DRIVERS:
+            print(f"note: NPU driver {self.driver} is untested; xdna1-llm is tested on {', '.join(TESTED_DRIVERS)}")
         self.kernels: dict[str, Kernel] = {}
 
     def load(self, tag: str, xclbin_path: str, insts_path: str) -> Kernel:
@@ -57,10 +71,17 @@ class Npu:
 class Kernel:
     def __init__(self, npu: Npu, tag: str, xclbin_path: str, insts_path: str):
         self.npu, self.tag = npu, tag
-        xb = xrt.xclbin(xclbin_path)
-        npu.dev.register_xclbin(xb)
-        self.ctx = xrt.hw_context(npu.dev, xb.get_uuid())
-        self.kernel = xrt.kernel(self.ctx, xb.get_kernels()[0].get_name())
+        try:
+            xb = xrt.xclbin(xclbin_path)
+            npu.dev.register_xclbin(xb)
+            self.ctx = xrt.hw_context(npu.dev, xb.get_uuid())
+            self.kernel = xrt.kernel(self.ctx, xb.get_kernels()[0].get_name())
+        except Exception as e:
+            raise NpuError(
+                f"The NPU driver ({npu.driver}) did not accept the kernel {os.path.basename(xclbin_path)}. "
+                f"xdna1-llm is tested on NPU driver {', '.join(TESTED_DRIVERS)}; newer drivers may not run "
+                f"first-generation (npu1) kernels. See {DRIVER_HELP} ({e})"
+            ) from e
         self.programs: dict[str, tuple] = {}
         self.add_program("default", insts_path)
 
@@ -109,6 +130,15 @@ def mapped(bo, dtype, shape=None) -> np.ndarray:
     """Zero-copy numpy view of a host_only buffer object."""
     a = np.frombuffer(bo.map(), dtype=dtype)
     return a.reshape(shape) if shape is not None else a
+
+
+def driver_version(dev) -> str:
+    """The Windows NPU driver's version, as XRT reports it ("unknown" if it does not)."""
+    try:
+        host = json.loads(dev.get_info(xrt.xrt_info_device.host))
+        return next(d["version"] for d in host.get("drivers", []) if "NPU" in d.get("name", ""))
+    except (ValueError, KeyError, StopIteration, RuntimeError):
+        return "unknown"
 
 
 def hard_exit(code: int = 0):

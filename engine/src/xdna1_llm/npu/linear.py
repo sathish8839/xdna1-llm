@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 
 from ..bf16 import to_bf16
-from ..gguf_weights import as_parts
+from ..gguf_weights import as_parts, dequantize
 from .device import COMPLETED, FROM_DEV, TO_DEV, Npu, mapped
 
 M_TILE, N_CHUNK = 256, 1024
@@ -39,8 +39,8 @@ def default_kernel_dir() -> str:
 class NpuLinear:
     wants_head = False  # the LM head stays on the CPU in fp32 for prefill
 
-    def __init__(self, npu: Npu | None = None, kernel_dir: str | None = None, ks=SUPPORTED_K):
-        self.npu = npu or Npu()
+    def __init__(self, npu: Npu | None = None, kernel_dir: str | None = None, ks=SUPPORTED_K, cache=None):
+        self.npu, self.cache = npu or Npu(), cache  # cache: a WeightCache for the converted weights, or None
         kdir = kernel_dir or default_kernel_dir()
         self.k = {}
         for K in ks:
@@ -64,21 +64,23 @@ class NpuLinear:
         self.calls = 0
 
     def register(self, name: str, w):
-        """w: bf16 bits, shape (out, in) as stored in GGUF (or BF16 tensors whose rows are stacked); out must be a
-        multiple of 1024."""
-        parts = as_parts(w)
-        if any(kind != "BF16" for kind, _ in parts):
-            raise ValueError(f"{name}: the prefill GEMM engine takes BF16 weights, got {[k for k, _ in parts]}")
-        wbits = np.concatenate([data for _, data in parts], axis=0)
-        out, K = wbits.shape
-        if out % N_CHUNK or K not in self.k:
-            raise ValueError(f"{name}: shape {wbits.shape} needs out % {N_CHUNK} == 0 and in in {tuple(self.k)}")
+        """w: bf16 bits of shape (out, in) as stored in GGUF, a GGUF tensor of any type (dequantized to bf16
+        here), or tensors whose rows are stacked; out must be a multiple of 1024."""
+
+        def chunks():  # (out / 1024, K, 1024): each chunk transposed, as its buffer holds it
+            wbits = np.concatenate([d if k == "BF16" else to_bf16(dequantize(k, d)) for k, d in as_parts(w)], axis=0)
+            out, K = wbits.shape
+            if out % N_CHUNK or K not in self.k:
+                raise ValueError(f"{name}: shape {wbits.shape} needs out % {N_CHUNK} == 0 and in in {tuple(self.k)}")
+            return np.ascontiguousarray(wbits.reshape(out // N_CHUNK, N_CHUNK, K).transpose(0, 2, 1))
+
+        B = self.cache.get("gemm/" + name, chunks) if self.cache else chunks()
+        K = B.shape[1]
         kern = self.k[K]["kern"]
         bos = []
-        for j in range(out // N_CHUNK):
-            B = np.ascontiguousarray(wbits[j * N_CHUNK : (j + 1) * N_CHUNK, :].T)  # (K, 1024) row-major
-            bo = self.npu.bo(B.nbytes, kern.group(1))
-            bo.write(B.tobytes(), 0)
+        for j in range(B.shape[0]):
+            bo = self.npu.bo(B[j].nbytes, kern.group(1))
+            bo.write(B[j].tobytes(), 0)
             bo.sync(TO_DEV)
             bos.append(bo)
         self.chunks[name] = (K, bos)

@@ -7,6 +7,30 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Release workflow (`.github/workflows/release.yml`, on `v*` tags or by hand): builds the `engine` and `qgemv`
+  kernels on Ubuntu with mlir-aie, runs their xclbinutil step on Windows with the XRT SDK (XRT has no Linux
+  binary: `kernels/xclbinutil-defer` records the calls, `kernels/package_xclbins.py` runs them), builds the
+  installer and attaches it and the kernels to a draft release. Checked locally: kernels recorded in WSL and
+  packaged on Windows pass the NPU tests and give the same greedy output.
+- Installer (`installer/build-installer.ps1`, Inno Setup): the portable build as a 62 MB per-user setup, with a
+  Start menu entry, a warning when the NPU driver is missing, and an uninstaller that offers to delete models,
+  cache and settings. The portable build now carries `THIRD-PARTY-NOTICES.txt` and `licenses/`, generated from
+  the packages it ships.
+- First-run model download in the app: LFM3-1.7B Q4_K_M or Q6_K from Hugging Face (pinned revision, SHA-256
+  checked, resumable, cancellable) into `%LOCALAPPDATA%\xdna1-llm\models`; the Model… button became a menu to
+  switch or download models, or pick a file.
+- NPU errors in plain words: no NPU or driver ("No AMD NPU found") and a driver that rejects the kernels (with
+  its version and the tested one) raise `NpuError`; the server prints it as one `error:` line, which the app
+  shows. An untested driver version is logged. docs/setup.md has an "NPU driver" section.
+- Copy button on code blocks in the app.
+- The engine reuses the last turn: a follow-up resumes from its state and runs only the tokens that differ
+  (a 368-token follow-up: first token 2.97 → 0.99 s). The conv layers' state is snapshotted at the end of each
+  prompt chunk and every 32 reply tokens, so a prompt that departs mid-reply rewinds to the nearest snapshot.
+  Resumed vs fresh: KLD ≤ 0.0005, same top token. Usage reports `prompt_tokens_details.cached_tokens`.
+- Weight cache (`xdna1_llm.weight_cache`): the NPU backends keep their converted weights (the GEMV's repacked
+  tiles, the GEMM's bf16 chunks) on disk, so later loads skip the conversion: Q4_K_M 38.0 → 18.5 s (the first
+  load writes 3.9 GB and takes 57.7 s). Keyed by the GGUF and the layout code; `--no-weight-cache`,
+  `XDNA1_LLM_CACHE`. The GEMM backend now dequantizes to bf16 itself.
 - Portable build (`installer/build-portable.ps1`): the app, the embeddable CPython 3.13 with the engine and
   pyxrt, and the kernels in one folder (241 MB) that needs only the NPU driver. The app now references
   `Microsoft.WindowsAppSDK.WinUI` instead of the metapackage (no AI/ML runtimes: 204 → 158 MB) and builds its

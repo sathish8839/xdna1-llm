@@ -16,7 +16,7 @@ prefilled in one batch and then continued token by token.
 
 Two linear backends: `lin` serves decode (and prefill when there is no other), `prefill_lin` (optional) serves
 prompt chunks of at least PREFILL_MIN tokens. For a Q4_K_M / Q6_K model on the NPU, `lin` is the quantized GEMV
-(one token per call) and `prefill_lin` the bf16 GEMM, which gets a bf16 copy of every linear weight at load.
+(one token per call) and `prefill_lin` the bf16 GEMM, which makes a bf16 copy of every linear weight at load.
 """
 
 from __future__ import annotations
@@ -26,8 +26,7 @@ from functools import partial
 
 import numpy as np
 
-from ..bf16 import to_bf16
-from ..gguf_weights import as_parts, dequantize
+from ..gguf_weights import dequantize
 
 EPS, LCONV, SWA_WINDOW = 1e-5, 7, 256
 CHUNK = 256  # prefill rows per pass (the bf16 GEMM's tile)
@@ -60,7 +59,11 @@ def apply_rope(x, cos, sin):  # x (T, H, D)
 
 
 class State:
-    """Decode state: the position, per attention layer the keys/values so far, per conv layer the last 6 inputs."""
+    """Decode state: the position, per attention layer the keys/values so far, per conv layer the last 6 inputs.
+
+    A state can go back to an earlier position, to reuse a shared prefix (the next chat turn starts with this
+    one). Attention needs nothing for that: keys/values past the position are overwritten. The conv window only
+    holds the latest inputs, so `snapshot` keeps a copy of it at chosen positions and `rewind` returns to one."""
 
     def __init__(self, model: LFM3, max_len: int):
         self.pos, self.max_len = 0, max_len
@@ -71,6 +74,21 @@ class State:
             else:
                 self.k[i] = np.zeros((max_len, model.kv_heads[i], model.hd), np.float32)
                 self.v[i] = np.zeros((max_len, model.kv_heads[i], model.hd), np.float32)
+        self.snaps = {0: {i: c.copy() for i, c in self.conv.items()}}  # position -> conv windows there
+
+    def snapshot(self):
+        """Remember the conv windows at the current position (about 0.6 MB for LFM3-1.7B)."""
+        self.snaps[self.pos] = {i: c.copy() for i, c in self.conv.items()}
+
+    def rewind(self, pos: int) -> int:
+        """Go back to the latest position <= pos the state can return to; returns that position."""
+        if pos >= self.pos:
+            return self.pos
+        p = max(q for q in self.snaps if q <= pos)
+        self.conv = {i: c.copy() for i, c in self.snaps[p].items()}
+        self.snaps = {q: s for q, s in self.snaps.items() if q <= p}
+        self.pos = p
+        return p
 
 
 class LFM3:
@@ -99,7 +117,7 @@ class LFM3:
         def register(name, wt):
             lin.register(name, wt)
             if prefill_lin is not None:
-                prefill_lin.register(name, _as_bf16(wt))
+                prefill_lin.register(name, wt)
 
         for i in range(self.n_layers):
             b = f"blk.{i}."
@@ -242,6 +260,7 @@ class LFM3:
             finally:
                 self.cur = self.lin
             st.pos += len(chunk)
+            st.snapshot()
             if all_logits:
                 logits.append(self.head(h))
             elif last:
@@ -321,8 +340,3 @@ class LFM3:
                 break
             logits = self.step(out[-1], st)
         return out, st, t1 - t0, time.perf_counter() - t1
-
-
-def _as_bf16(wt):
-    """A weight (or stacked parts) as bf16 bits for the GEMM backend, dequantizing GGUF types."""
-    return [("BF16", d if k == "BF16" else to_bf16(dequantize(k, d))) for k, d in as_parts(wt)]

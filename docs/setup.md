@@ -14,9 +14,17 @@ Tested configuration (November 2026):
 | mlir-aie | 1.4.6.dev63 (commit 0f76700), llvm-aie (Peano) 22.0.0.2026102001 |
 | Python | 3.13 on Windows (pyxrt is built for 3.13), 3.12 in WSL |
 
-> **Newer NPU drivers:** an npu1 abort on Windows was reported with driver 32.0.20101.3760
-> ([amd/Triton-XDNA#88](https://github.com/amd/Triton-XDNA/issues/88)). On the driver above, our kernels run
-> correctly. Please open a hardware report with your driver version and results.
+## NPU driver
+
+The engine needs AMD's NPU driver: Device Manager lists it under **Neural processors**. It is tested on
+32.0.203.297; with any other version it logs `note: NPU driver ... is untested` and carries on. An npu1 abort on
+Windows was reported with driver 32.0.20101.3760
+([amd/Triton-XDNA#88](https://github.com/amd/Triton-XDNA/issues/88)).
+
+* **"No AMD NPU found"**: the processor has no XDNA1 NPU, or the driver is not installed. Install it from your
+  PC maker's support page.
+* **"The NPU driver did not accept the kernel"**: the driver refused our npu1 kernels, which newer drivers may
+  do. Installing 32.0.203.297 works; please also open a hardware report with your driver version.
 
 ## 1. Windows: NPU runtime and engine
 
@@ -57,6 +65,12 @@ MLIR_AIE=~/mlir-aie XRT_SDK_WIN=/mnt/c/Users/<you>/xrt_sdk/xrt_sdk/xrt ./kernels
 
 Kernel sets: `engine` (the two prefill GEMMs), `qgemv` (the Q4_K / Q6_K decode GEMV, every shape of Q4_K_M and Q6_K
 models), `gemv` (bf16 decode GEMV), `shapes` (benchmark kernels), `bw`, `smoke`, `all`.
+
+**In CI** (`.github/workflows/release.yml`, on a `v*` tag or by hand) the kernels build on an Ubuntu runner from
+mlir-aie at the pinned commit. XRT ships no Linux `xclbinutil`, so with `XCLBINUTIL_DEFER=<dir>` the build
+records each call (`kernels/xclbinutil-defer`) and writes placeholder `.xclbin` files; a Windows job then runs
+the calls with the SDK's `xclbinutil.exe` (`kernels/package_xclbins.py`), builds the installer, and attaches both
+to a draft release. The same split works locally: record in WSL, then package on Windows.
 
 ## 3. Model
 
@@ -109,6 +123,21 @@ This assembles a folder that runs on any XDNA1 PC with the stock NPU driver, wit
 contains the app (published self-contained), the embeddable CPython 3.13 with the engine, its dependencies and
 `pyxrt.pyd` in `python\`, and the kernels in `kernels\`. It needs the .NET 8 SDK, uv, built kernels and pyxrt in
 `engine\.venv` (or pass `-Kernels` and `-Pyxrt`). The app uses `python\` and `kernels\` when they sit beside it.
+The folder also gets `LICENSE`, `NOTICE`, `THIRD-PARTY-NOTICES.txt` and `licenses\` (written by
+`installer\notices.py` from what the build ships).
+
+### Installer
+
+```powershell
+winget install JRSoftware.InnoSetup   # once
+.\installer\build-installer.ps1       # -> dist\xdna1-llm-setup-<version>.exe
+```
+
+Wraps the portable build with Inno Setup (`installer\xdna1-llm.iss`, about 60 MB). It installs for the current user
+into `%LOCALAPPDATA%\Programs\xdna1-llm` without an admin prompt, warns when the NPU driver is missing, and adds a
+Start menu entry. On first run the app offers to download LFM3-1.7B Q4_K_M or Q6_K from Hugging Face (a pinned
+revision, checked by SHA-256) into `%LOCALAPPDATA%\xdna1-llm\models`. Uninstalling asks whether to delete the
+models, weight cache and settings too.
 
 ### The OpenAI-compatible server
 
@@ -135,3 +164,5 @@ Environment variables:
 * `XDNA1_LLM_KERNELS`: the kernel directory. By default the engine uses `kernels/build` in a source checkout,
   else `%LOCALAPPDATA%\xdna1-llm\kernels`.
 * `XDNA1_LLM_GGUF`: the default model path.
+* `XDNA1_LLM_CACHE`: where the converted NPU weights are kept (default `%LOCALAPPDATA%\xdna1-llm\cache`, about
+  4 GB per model, rebuilt when the model or the layout code changes). `--no-weight-cache` turns it off.

@@ -23,7 +23,8 @@ and aims for the Q4_K_M quant running entirely on the NPU, behind:
 
 > [!IMPORTANT]
 > **Pre-alpha.** Prefill and token generation (Q4_K_M or Q6_K) run on the NPU and match a CPU reference, with
-> the model's own tokenizer and chat template. An OpenAI-compatible server and a first Windows chat app work; the installer is still to come. See the [roadmap](docs/roadmap.md).
+> the model's own tokenizer and chat template. An OpenAI-compatible server, a Windows chat app and an installer
+> work; there is no published release yet. See the [roadmap](docs/roadmap.md).
 
 ## Results so far
 
@@ -50,7 +51,7 @@ That is **1.6× faster and 2.5× less energy than the CPU, with the CPU nearly f
 | Accuracy harness: perplexity and KL divergence vs BF16; NPU engine adds ~0 on top of the GGUF | ✅ |
 | OpenAI-compatible server (streaming, thinking, tool calls), ~14 tok/s through the OpenAI SDK | ✅ |
 | Windows app: streaming markdown chat, thinking toggle, DuckDuckGo web search, NPU status and speed | ✅ |
-| Installer with prebuilt kernels | ⏳ |
+| Installer with prebuilt kernels; the app downloads the model on first run | ✅ |
 | Norms, conv, attention and SwiGLU fused on the NPU | ⏳ |
 
 ## Supported hardware
@@ -66,7 +67,8 @@ is the most valuable contribution right now**, especially with newer NPU drivers
 
 ## Try it (developers)
 
-There is no installer yet. For now you need the XRT SDK, plus WSL to build the kernels. The full guide is in
+There is no published release yet; `installer\build-installer.ps1` builds the installer from a checkout. To work
+on the engine you need the XRT SDK, plus WSL to build the kernels. The full guide is in
 [docs/setup.md](docs/setup.md).
 
 ```powershell

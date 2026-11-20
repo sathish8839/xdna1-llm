@@ -20,6 +20,7 @@ import argparse
 import itertools
 import json
 import os
+import sys
 import threading
 import time
 import traceback
@@ -27,6 +28,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .engine import Engine, Event, RequestError
+from .npu import NpuError
 
 
 def request_args(body: dict) -> dict:
@@ -194,6 +196,23 @@ def serve(engine: Engine, host: str = "127.0.0.1", port: int = 8080) -> Threadin
     return ThreadingHTTPServer((host, port), handler)
 
 
+def _load(a) -> Engine:
+    return Engine.load(
+        a.gguf,
+        a.backend,
+        a.kernels,
+        gemm_prompt=not a.no_gemm_prompt,
+        weight_cache=not a.no_weight_cache,
+        ctx=a.ctx,
+        thinking=a.thinking,
+    )
+
+
+def _startup_error(e: Exception) -> bool:
+    """A failure the user can act on (no NPU or driver, missing files), as opposed to a bug."""
+    return isinstance(e, (NpuError, FileNotFoundError, ImportError))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="xdna1-llm-server")
     ap.add_argument("--gguf", default=os.environ.get("XDNA1_LLM_GGUF"), help="LFM3 Q4_K_M or Q6_K GGUF")
@@ -204,12 +223,20 @@ def main(argv=None):
     ap.add_argument("--ctx", type=int, default=4096, help="context length in tokens (prompt + reply)")
     ap.add_argument("--thinking", action="store_true", help="think before answering unless a request says not to")
     ap.add_argument("--no-gemm-prompt", action="store_true", help="no bf16 weight copy; prompts run on the GEMV")
+    ap.add_argument("--no-weight-cache", action="store_true", help="convert the weights on every load")
     a = ap.parse_args(argv)
     if not a.gguf:
         ap.error("--gguf (or XDNA1_LLM_GGUF) is required")
 
     t0 = time.perf_counter()
-    eng = Engine.load(a.gguf, a.backend, a.kernels, gemm_prompt=not a.no_gemm_prompt, ctx=a.ctx, thinking=a.thinking)
+    try:
+        eng = _load(a)
+    except Exception as e:
+        if not _startup_error(e):
+            raise
+        print(f"error: {e}", file=sys.stderr, flush=True)  # one line the app shows as is
+        sys.stdout.flush()
+        os._exit(2)  # no pyxrt destructors (see npu.device.hard_exit)
     srv = serve(eng, a.host, a.port)
     print(f"{eng.name} ready in {time.perf_counter() - t0:.0f} s; serving http://{a.host}:{a.port}/v1", flush=True)
     try:
