@@ -265,9 +265,9 @@ class LFM3:
         st.pos += 1
         return self.head(h)[0]
 
-    def generate(self, ids, n: int, st: State | None = None, on_token=None, logits_out: list | None = None):
-        """Greedy decoding: feed the prompt one token at a time, then generate n tokens.
-        Returns (new token ids, state, prompt seconds, generation seconds)."""
+    def generate(self, ids, n: int, st: State | None = None, on_token=None, logits_out: list | None = None, stop=()):
+        """Greedy decoding: feed the prompt one token at a time, then generate up to n tokens, ending early after a
+        token in `stop` (end-of-generation ids). Returns (new token ids, state, prompt seconds, generation seconds)."""
         st = st or self.new_state()
         t0 = time.perf_counter()
         for t in ids:
@@ -280,7 +280,7 @@ class LFM3:
             out.append(int(np.argmax(logits)))
             if on_token:
                 on_token(out[-1])
-            if len(out) == n:
+            if len(out) == n or out[-1] in stop:
                 break
             logits = self.step(out[-1], st)
         return out, st, t1 - t0, time.perf_counter() - t1

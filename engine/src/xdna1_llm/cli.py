@@ -1,60 +1,64 @@
-"""Command line: prefill a prompt on the NPU (or CPU reference) and compare with llama.cpp.
+"""Command line: prefill a prompt on the NPU (or CPU reference), or generate from it, optionally next to llama.cpp.
 
   python -m xdna1_llm.cli --gguf LFM3-1.7B-BF16.gguf --prompt "The capital of France is" --compare
+  python -m xdna1_llm.cli --gguf LFM3-1.7B-Q4_K_M.gguf --chat --prompt "Name three rivers." --generate 200
 
-Needs a llama-server for tokenization: pass --llama-server PATH to start one, or --server URL for a running one.
+Tokenization and the chat template come from the GGUF. llama.cpp is optional, as a reference: pass --llama-server
+PATH to start one, or --server URL for a running one, to get its [llama.cpp] lines.
 """
 
 from __future__ import annotations
 
 import argparse
+import codecs
 import os
 import time
 
 import numpy as np
 
+from . import chat
 from .cpu_linear import CpuLinear
 from .gguf_weights import GGUFWeights
 from .models.lfm3 import LFM3
 from .reference import LlamaServer
+from .tokenizer import Tokenizer
 
 M_TILE = 256
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="xdna1-llm")
-    ap.add_argument("--gguf", default=os.environ.get("XDNA1_LLM_GGUF"), help="path to a BF16 LFM3 GGUF")
+    ap.add_argument("--gguf", default=os.environ.get("XDNA1_LLM_GGUF"), help="path to an LFM3 GGUF")
     ap.add_argument("--prompt", default="The capital of France is")
+    ap.add_argument("--chat", action="store_true", help="send --prompt as a user message through the chat template")
+    ap.add_argument("--no-think", action="store_true", help="with --chat: answer without a thinking block")
     ap.add_argument("--backend", choices=("npu", "cpu"), default="npu")
     ap.add_argument("--compare", action="store_true", help="also run the CPU reference and compare per layer")
     ap.add_argument("--repeat", type=int, default=1)
-    ap.add_argument("--server", default="http://127.0.0.1:18080")
-    ap.add_argument("--llama-server", help="path to llama-server.exe to start for tokenization/reference")
+    ap.add_argument("--server", default="http://127.0.0.1:18080", help="a running llama-server to compare with")
+    ap.add_argument("--llama-server", help="path to llama-server.exe to start as the reference")
     ap.add_argument("--kernels", help="directory with built xclbins (default: kernels/build or $XDNA1_LLM_KERNELS)")
     ap.add_argument(
-        "--generate", type=int, metavar="N", help="decode N tokens greedily (Q4_K_M or Q6_K GGUF, NPU GEMVs)"
+        "--generate", type=int, metavar="N", help="decode up to N tokens greedily (Q4_K_M or Q6_K GGUF, NPU GEMVs)"
     )
     a = ap.parse_args(argv)
     if not a.gguf:
         ap.error("--gguf (or XDNA1_LLM_GGUF) is required")
 
-    srv = LlamaServer(a.server)
-    if a.llama_server and not srv.healthy():
-        print("starting llama-server (CPU only) ...", flush=True)
-        srv.start(a.llama_server, a.gguf)
-    loaded = srv.model_path()
-    if loaded and os.path.normcase(os.path.abspath(loaded)) != os.path.normcase(os.path.abspath(a.gguf)):
-        print(f"note: the llama-server at {a.server} has {loaded} loaded; [llama.cpp] lines are from that model")
-    ids = srv.tokenize(a.prompt)
+    w = GGUFWeights(a.gguf)
+    tok = Tokenizer.from_gguf(w)
+    text = chat.render([{"role": "user", "content": a.prompt}], enable_thinking=not a.no_think) if a.chat else a.prompt
+    ids = tok.encode(text)
+    if not ids:
+        ap.error("the prompt is empty")
+    srv = reference_server(a)
     if a.generate:
-        return generate(a, srv, ids)
+        return generate(a, w, tok, srv, ids)
     if len(ids) > M_TILE:
         print(f"prompt has {len(ids)} tokens; keeping the last {M_TILE} (single-tile prefill)")
         ids = ids[-M_TILE:]
     print(f"prompt: {len(ids)} tokens")
 
-    w = GGUFWeights(a.gguf)
-    vocab = w.tokens()
     backends = ["npu", "cpu"] if a.compare else [a.backend]
     results, keep = {}, []
     for be in backends:
@@ -78,7 +82,7 @@ def main(argv=None):
                 flush=True,
             )
         top = np.argsort(-logits)[:5]
-        print(f"[{be}] top-5 next: " + ", ".join(f"{vocab[t]!r}({logits[t]:.2f})" for t in top))
+        print(f"[{be}] top-5 next: " + ", ".join(f"{tok.decode([t], True)!r}({logits[t]:.2f})" for t in top))
         results[be] = (logits, hidden)
         keep.append((m, lin))  # keep pyxrt objects alive until hard exit
 
@@ -89,17 +93,31 @@ def main(argv=None):
             print(f"  layer {i:2d} ({m.kind(i)}): cosine {cs:.6f}")
         cs = float(ln @ lc / (np.linalg.norm(ln) * np.linalg.norm(lc)))
         print(f"  logits cosine {cs:.6f}; top-1 match: {int(np.argmax(ln)) == int(np.argmax(lc))}")
-    print("[llama.cpp] top-5 next: " + ", ".join(f"{t!r}({p:.2f})" for t, p in srv.top_next(ids)))
-    srv.stop()
+    if srv:
+        print("[llama.cpp] top-5 next: " + ", ".join(f"{t!r}({p:.2f})" for t, p in srv.top_next(ids)))
+        srv.stop()
     if "npu" in backends:
         from .npu.device import hard_exit
 
         hard_exit(0)
 
 
-def generate(a, srv, ids):
-    """Decode on the NPU (or the CPU reference) and compare the tokens with llama.cpp's greedy output."""
-    w = GGUFWeights(a.gguf)
+def reference_server(a) -> LlamaServer | None:
+    """The llama-server to compare with: started from --llama-server, or one already running at --server."""
+    srv = LlamaServer(a.server)
+    if not srv.healthy():
+        if not a.llama_server:
+            return None
+        print("starting llama-server (CPU only) ...", flush=True)
+        srv.start(a.llama_server, a.gguf)
+    loaded = srv.model_path()
+    if loaded and os.path.normcase(os.path.abspath(loaded)) != os.path.normcase(os.path.abspath(a.gguf)):
+        print(f"note: the llama-server at {a.server} has {loaded} loaded; [llama.cpp] lines are from that model")
+    return srv
+
+
+def generate(a, w, tok, srv, ids):
+    """Decode on the NPU (or the CPU reference), print the text as it comes, and compare with llama.cpp if given."""
     if a.backend == "npu":
         from .npu.qlinear import NpuQLinear  # imports pyxrt
 
@@ -112,14 +130,17 @@ def generate(a, srv, ids):
 
     m.cpu_ms, lin.npu_ms, lin.calls = 0.0, 0.0, 0
     logits = []
-    dot = lambda t: print(".", end="", flush=True)  # noqa: E731
-    out, st, t_prompt, t_gen = m.generate(ids, a.generate, on_token=dot, logits_out=logits)
+    utf8 = codecs.getincrementaldecoder("utf-8")("replace")  # a character can span tokens
+
+    def show(t):
+        print(utf8.decode(tok.token_bytes(t)), end="", flush=True)
+
+    out, st, t_prompt, t_gen = m.generate(ids, a.generate, on_token=show, logits_out=logits, stop=tok.eog)
     n_steps = len(ids) + len(out) - 1
-    print(f"\n[{a.backend}] {srv.detokenize(out)!r}")
     print(
-        f"[{a.backend}] prompt {len(ids) / t_prompt:.1f} tok/s, generation {(len(out) - 1) / t_gen:.1f} tok/s; "
-        f"per token: linears {lin.npu_ms / n_steps:.1f} ms in {lin.calls / n_steps:.0f} calls, "
-        f"cpu ops {m.cpu_ms / n_steps:.1f} ms"
+        f"\n[{a.backend}] {len(out)} tokens; prompt {len(ids) / t_prompt:.1f} tok/s, generation "
+        f"{(len(out) - 1) / max(t_gen, 1e-9):.1f} tok/s; per token: linears {lin.npu_ms / n_steps:.1f} ms in "
+        f"{lin.calls / n_steps:.0f} calls, cpu ops {m.cpu_ms / n_steps:.1f} ms"
     )
     if a.compare and a.backend == "npu":  # the exact fp32 CPU reference along the same tokens
         cpu = LFM3(w, CpuLinear())
@@ -132,11 +153,12 @@ def generate(a, srv, ids):
             cs = float(logits[i] @ ref_logits / (np.linalg.norm(logits[i]) * np.linalg.norm(ref_logits)))
             same = int(np.argmax(logits[i])) == int(np.argmax(ref_logits))
             print(f"  token {i}: logits cosine vs fp32 CPU {cs:.6f}, same top-1 {same}", flush=True)
-    ref = srv.generate(ids, a.generate)
-    print(f"[llama.cpp] {srv.detokenize(ref)!r}")
-    same = next((i for i, (x, y) in enumerate(zip(out, ref, strict=False)) if x != y), min(len(out), len(ref)))
-    print(f"first {same} of {len(ref)} tokens identical to llama.cpp")
-    srv.stop()
+    if srv:
+        ref = srv.generate(ids, a.generate)
+        print(f"[llama.cpp] {tok.decode(ref)!r}")
+        same = next((i for i, (x, y) in enumerate(zip(out, ref, strict=False)) if x != y), min(len(out), len(ref)))
+        print(f"first {same} of {len(ref)} tokens identical to llama.cpp")
+        srv.stop()
     if a.backend == "npu":
         from .npu.device import hard_exit
 

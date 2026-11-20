@@ -200,7 +200,7 @@ layers rotate 32 of 64 pairs); `attn_gate` is a per-head sigmoid gate applied be
 
 `benchmarks/eval_quality.py` makes every variant predict each next token of a text
 ([`benchmarks/data/eval.txt`](../benchmarks/data/eval.txt): prose, Python, a worked word problem, a tool call,
-instructions, dialogue; 1,440 tokens in chunks of 256, each starting from an empty context) and compares it
+instructions, dialogue; 1,441 tokens in chunks of 256, each starting from BOS with an empty context) and compares it
 with the original BF16 weights run in fp32 on the CPU. These are the measures llama.cpp uses to judge
 quantizations:
 
@@ -211,34 +211,35 @@ quantizations:
 
 | Variant | file | perplexity | mean KLD vs BF16 | KLD p99 | same top-1 as BF16 |
 |---|---|---|---|---|---|
-| BF16 (reference) | 3.47 GB | 7.177 | — | — | — |
-| Q8_0 | 1.85 GB | 7.179 | 0.0005 | 0.004 | 99.0 % |
-| Q6_K | 1.43 GB | 7.161 | 0.0057 | 0.052 | 95.8 % |
-| **Q4_K_M** (what decode runs today) | 1.10 GB | 7.606 (+6.0 %) | 0.056 | 0.47 | 88.6 % |
-| Q4_K_M on our NPU engine | | 7.607 | 0.057 | 0.47 | 88.5 % |
-| Q6_K on our NPU engine | | 7.158 | 0.0061 | 0.057 | 95.9 % |
-| *NPU engine vs the same Q4_K_M on the CPU* | | | *0.0001* | *0.001* | *99.4 %* |
-| *NPU engine vs the same Q6_K on the CPU* | | | *0.00005* | *0.0004* | *99.8 %* |
+| BF16 (reference) | 3.47 GB | 6.129 | — | — | — |
+| Q8_0 | 1.85 GB | 6.125 | 0.0003 | 0.002 | 99.4 % |
+| Q6_K | 1.43 GB | 6.098 | 0.0031 | 0.019 | 97.4 % |
+| **Q4_K_M** | 1.10 GB | 6.321 (+3.1 %) | 0.035 | 0.21 | 92.0 % |
+| Q4_K_M on our NPU engine | | 6.324 | 0.035 | 0.21 | 92.0 % |
+| Q6_K on our NPU engine | | 6.099 | 0.0031 | 0.020 | 97.4 % |
+| *NPU engine vs the same Q4_K_M on the CPU* | | | *0.00002* | *0.0001* | *99.7 %* |
+| *NPU engine vs the same Q6_K on the CPU* | | | *0.00002* | *0.0002* | *99.7 %* |
 
-* **The engine adds nothing measurable.** Against the same Q4_K_M weights in fp32 the NPU path's KLD is 0.0001,
-  500× below what the format itself costs; the 0.6 % of tokens where the top-1 differs are near-ties.
-* **Q4_K_M has a real cost on this 1.7B model:** perplexity +6 %, and about one token in nine gets a different
-  first choice than BF16 (often a near-synonym, but it shows up first in arithmetic, exact facts and formats).
-  Small models lose more to 4-bit than 7B+ ones.
-* **Q6_K is close to lossless** (KLD 10× lower, perplexity within noise of BF16) for 30 % more bytes, and runs
+* **The engine adds nothing measurable.** Against the same GGUF weights in fp32 the NPU path's KLD is 0.00002,
+  over 100× below what either format costs; the 0.3 % of tokens where the top-1 differs are near-ties.
+* **Q4_K_M has a real cost on this 1.7B model:** perplexity +3 %, and about one token in twelve gets a
+  different first choice than BF16 (often a near-synonym, but it shows up first in arithmetic, exact facts and
+  formats). Small models lose more to 4-bit than 7B+ ones.
+* **Q6_K is close to lossless** (KLD 11× lower, perplexity within noise of BF16) for 30 % more bytes, and runs
   on the same decode GEMV and context (four more instruction streams: 2048, 3072, 6144 and 15360 × 2048).
 
 | Decode on the NPU (32–64 tokens) | file | generation | linears per token | logits vs BF16 (KLD) |
 |---|---|---|---|---|
-| Q4_K_M ("fast"), first 6-bit kernel | 1.10 GB | 13.5–13.7 tok/s | 68 ms, 102 calls | 0.057 |
-| Q6_K ("quality"), first 6-bit kernel | 1.43 GB | 10.6–10.9 tok/s | 86–88 ms, 97 calls | 0.006 |
-| Q4_K_M, faster kernel | | **14.1–14.9 tok/s** | 61.5–64 ms | 0.057 |
-| Q6_K, faster kernel, q6only tiles | | **12.1–13.2 tok/s** | 72–75.5 ms | 0.006 |
+| Q4_K_M ("fast"), first 6-bit kernel | 1.10 GB | 13.5–13.7 tok/s | 68 ms, 102 calls | 0.035 |
+| Q6_K ("quality"), first 6-bit kernel | 1.43 GB | 10.6–10.9 tok/s | 86–88 ms, 97 calls | 0.003 |
+| Q4_K_M, faster kernel | | **14.1–14.9 tok/s** | 61.5–64 ms | 0.035 |
+| Q6_K, faster kernel, q6only tiles | | **12.1–13.2 tok/s** | 72–75.5 ms | 0.003 |
 
   The laptop also has a slower state (CPU ops double from ~5.5 to ~10 ms, and the NPU calls slow down too) in
   which the same builds give 12.4 (Q4_K_M) and 10.2–10.9 tok/s (Q6_K); the table compares runs in the normal
   state.
-* 1,440 tokens is small: differences under ~1 % perplexity are noise. Q6_K / Q8_0 were made locally from the
+* 1,441 tokens is small: differences under ~1 % perplexity are noise. (An earlier version of this table started
+  each chunk with the text's first token instead of BOS, which inflated every number; the ranking was the same.) Q6_K / Q8_0 were made locally from the
   BF16 GGUF with `llama-quantize` (no imatrix).
 
 ## Related work

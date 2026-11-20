@@ -1,6 +1,6 @@
 # Architecture
 
-This describes what exists today. Planned parts (tokenizer, server, Q4_K_M, the app) are in the
+This describes what exists today. Planned parts (sampling, the server, the app) are in the
 [roadmap](roadmap.md).
 
 ```
@@ -11,8 +11,10 @@ engine/src/xdna1_llm/
   models/lfm3.py     LFM3 forward pass (short conv, GQA attention, SwiGLU) over a linear backend
   gguf_weights.py    memory-mapped GGUF tensors (BF16, F32)
   bf16.py            float32 <-> bf16 bit conversion
-  reference.py       llama-server client: tokenizer and ground truth until the native tokenizer exists
-  cli.py             run a prompt on the NPU and/or CPU and compare against llama.cpp
+  tokenizer.py       byte-level BPE from the GGUF (Llama 3 pre-tokenizer), identical to llama.cpp
+  chat.py            LFM3's chat template (thinking, tools) in Python
+  reference.py       llama-server client: the optional ground truth for tests and benchmarks
+  cli.py             run a prompt or chat message on the NPU and/or CPU, optionally against llama.cpp
 kernels/build_kernels.sh   builds the xclbins from mlir-aie's whole_array GEMM example
 ```
 

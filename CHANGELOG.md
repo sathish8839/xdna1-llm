@@ -7,6 +7,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Native tokenizer (`xdna1_llm.tokenizer`): byte-level BPE read from the GGUF with the Llama 3 pre-tokenizer,
+  identical to llama.cpp token for token (`benchmarks/check_tokenizer.py`). Chat template in Python
+  (`xdna1_llm.chat`: thinking, tools, tool results), identical to the GGUF's Jinja template. `xdna1-llm --chat`
+  streams text, stops at end of turn and needs no llama-server.
+- Fixed: `eval_quality.py` started every chunk with the text's first token instead of BOS (llama.cpp adds no
+  BOS for LFM3); accuracy numbers re-measured.
+
 - NPU runtime for XDNA1 (npu1) on Windows through pyxrt from the XRT Windows SDK.
 - Chunked bf16 GEMM engine: every LFM3-1.7B linear layer runs on the NPU (prefill up to 256 tokens).
 - LFM3 model (short conv, GQA attention with sliding window, SwiGLU) loading BF16 GGUF weights; output matches
@@ -21,10 +28,10 @@ All notable changes to this project are documented here. The format follows
 - Faster quantized GEMV: 64-byte bit masks, bytes to bf16 by one shuffle, x read from memory, independent
   accumulators and a twice-unrolled group loop (Q6_K GEMVs 15–25 % faster, Q4_K ~10 %). All-Q6_K models use
   a padding-free `q6only` tile geometry. Decode: Q6_K ~11 → ~12–13 tok/s, Q4_K_M ~14 → ~14–15 tok/s.
-- Q6_K "quality" model: an all-Q6_K GGUF decodes on the same NPU GEMV at ~11 tok/s with KLD 0.006 against
-  BF16 (Q4_K_M: ~14 tok/s, KLD 0.056). The CLI warns when a running llama-server holds a different model.
+- Q6_K "quality" model: an all-Q6_K GGUF decodes on the same NPU GEMV at ~11 tok/s with KLD 0.003 against
+  BF16 (Q4_K_M: ~14 tok/s, KLD 0.035). The CLI warns when a running llama-server holds a different model.
 - Accuracy harness (`benchmarks/eval_quality.py`, `xdna1_llm.quality`): perplexity, KL divergence and top-1
-  agreement against BF16. Q4_K_M costs +6 % perplexity on LFM3-1.7B, Q6_K ~0; the NPU engine adds KLD 0.0001.
+  agreement against BF16. Q4_K_M costs +3 % perplexity on LFM3-1.7B, Q6_K ~0; the NPU engine adds KLD 0.00002.
   The CPU reference also reads Q8_0.
 - Decode: q, k and v run as one weight, calls with several weight groups are queued together, and the host
   polls for completion instead of sleeping (11–12 → ~14 tok/s).

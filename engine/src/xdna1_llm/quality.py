@@ -43,10 +43,9 @@ class Score:
         }
 
 
-def chunks(ids: list[int], size: int, max_tokens: int | None = None) -> list[list[int]]:
-    """Cut a tokenized text (ids[0] = BOS) into chunks of `size` tokens that each start with BOS, so every chunk
-    is scored from an empty context. A trailing piece shorter than half a chunk is dropped."""
-    bos, body = ids[0], ids[1:]
+def chunks(body: list[int], bos: int, size: int, max_tokens: int | None = None) -> list[list[int]]:
+    """Cut a tokenized text (without BOS) into chunks of `size` tokens that each start with BOS, so every chunk is
+    scored from an empty context. A trailing piece shorter than half a chunk is dropped."""
     if max_tokens:
         body = body[:max_tokens]
     out = [[bos, *body[i : i + size - 1]] for i in range(0, len(body), size - 1)]

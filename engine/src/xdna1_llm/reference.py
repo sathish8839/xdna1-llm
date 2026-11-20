@@ -1,4 +1,4 @@
-"""llama.cpp `llama-server` as tokenizer and ground truth (until a native GGUF tokenizer lands, see docs/roadmap.md).
+"""llama.cpp `llama-server` as the reference: tokenization, logits and greedy output to compare against.
 
 Note: CUDA builds of llama.cpp offload large prompt batches to the GPU even with -ngl 0. `start_server` hides CUDA
 devices so CPU baselines are honest.

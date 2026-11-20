@@ -28,10 +28,10 @@ def test_known_values():
 
 
 def test_chunks_start_with_bos():
-    ids = [99, *range(10)]
-    c = chunks(ids, 4)
+    ids = list(range(10))
+    c = chunks(ids, 99, 4)
     assert c == [[99, 0, 1, 2], [99, 3, 4, 5], [99, 6, 7, 8]]  # [99, 9] is shorter than half a chunk
-    assert chunks(ids, 4, max_tokens=5) == [[99, 0, 1, 2], [99, 3, 4]]
+    assert chunks(ids, 99, 4, max_tokens=5) == [[99, 0, 1, 2], [99, 3, 4]]
 
 
 def test_prefill_all_logits_match_decode():

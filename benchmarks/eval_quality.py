@@ -23,7 +23,7 @@ from xdna1_llm.cpu_linear import CpuLinear
 from xdna1_llm.gguf_weights import GGUFWeights
 from xdna1_llm.models.lfm3 import LFM3
 from xdna1_llm.quality import Score, chunks, log_softmax
-from xdna1_llm.reference import LlamaServer
+from xdna1_llm.tokenizer import Tokenizer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -58,19 +58,15 @@ def evaluate():
     ap.add_argument("--tokens", type=int, help="score at most this many tokens of the text")
     ap.add_argument("--npu", action="store_true", help="also run the first --quant on the NPU decode path")
     ap.add_argument("--kernels", help="directory with built xclbins")
-    ap.add_argument("--server", default="http://127.0.0.1:18080")
-    ap.add_argument("--llama-server", help="llama-server.exe, for tokenization")
     a = ap.parse_args()
 
-    srv = LlamaServer(a.server)
-    if a.llama_server and not srv.healthy():
-        srv.start(a.llama_server, a.base)
+    base = GGUFWeights(a.base)
+    tok = Tokenizer.from_gguf(base)
     with open(a.text, encoding="utf-8") as f:
-        parts = chunks(srv.tokenize(f.read()), a.chunk, a.tokens)
-    srv.stop()
+        parts = chunks(tok.encode(f.read(), add_bos=False), tok.bos, a.chunk, a.tokens)
     print(f"{sum(len(c) - 1 for c in parts)} scored tokens in {len(parts)} chunks of up to {a.chunk}", flush=True)
 
-    variants = {"bf16": (LFM3(GGUFWeights(a.base), CpuLinear()), prefill_logits)}
+    variants = {"bf16": (LFM3(base, CpuLinear()), prefill_logits)}
     for path in a.quant:
         name = os.path.splitext(os.path.basename(path))[0].rsplit("-", 1)[-1].lower()  # LFM3-1.7B-Q4_K_M -> q4_k_m
         variants[name] = (LFM3(GGUFWeights(path), CpuLinear()), prefill_logits)

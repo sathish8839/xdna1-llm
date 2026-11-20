@@ -10,7 +10,7 @@ tokenizes, schedules and samples.
 |---|---|---|
 | M0 | Toolchain: npu1 kernels compiled in WSL run on Windows via pyxrt; driver limits measured | ✅ |
 | M1 | Prefill with every linear layer on the NPU (bf16), verified against llama.cpp | ✅ |
-| M2 | Native tokenizer, chat template, sampling and a generation loop (no llama-server needed) | next |
+| M2 | Native tokenizer, chat template, sampling and a generation loop (no llama-server needed) | in progress |
 | M3 | Decode on the NPU: M=1 GEMV kernel, KV cache, short-conv state | |
 | M4 | **Q4_K_M** weights: Q4_K / Q6_K repacked at load and dequantized on the NPU | |
 | M5 | OpenAI-compatible server: `/v1/chat/completions` (SSE streaming, tool calls), `/v1/models` | |
@@ -41,10 +41,13 @@ These come from measurements in [benchmarks.md](benchmarks.md) (the last one is 
 
 ## M2: tokenizer and generation
 
-* Byte-level BPE from the GGUF (`tokenizer.ggml.tokens`, `merges`, pre-tokenizer `lfm2`), checked token for
-  token against llama.cpp on a test corpus.
-* Chat template rendering, including LFM3's `enable_thinking` switch; sampling (greedy, top-k/top-p, temperature).
-* Generation loop: NPU prefill, then decode (CPU at first, until M3 lands).
+* Byte-level BPE from the GGUF (`tokenizer.ggml.tokens`, `merges`, pre-tokenizer `lfm2`): done
+  (`xdna1_llm/tokenizer.py`), identical to llama.cpp token for token on the eval text and edge cases
+  (`benchmarks/check_tokenizer.py`).
+* Chat template: done (`xdna1_llm/chat.py`, a Python port of the GGUF's Jinja template with thinking, tools and
+  tool results), identical to the Jinja render. `xdna1-llm --chat` runs without a llama-server.
+* Sampling (top-k/top-p, temperature, repetition penalty): next; decoding is greedy today.
+* Generation loop: done (`LFM3.generate`, stops at `<|im_end|>`); the prompt is still fed one token at a time.
 
 ## M3: decode on the NPU
 
@@ -79,8 +82,8 @@ GGUF Q4_K_M mixes **Q4_K** (most tensors) and **Q6_K** (for LFM3-1.7B: `token_em
 3. **Optional W4A8:** AIE2's int4 × int8 MAC modes with per-token int8 activations. Faster, slightly different
    numerics; benchmark against (2).
 4. Q6_K: same structure with a 6-bit unpack. Done for decode (`kernels/designs/qgemv.cc`).
-5. **Quality option:** done. Q4_K_M costs +6 % perplexity and KLD 0.056 against BF16 on LFM3-1.7B, Q6_K
-   KLD 0.006 ([benchmarks §6](benchmarks.md#6-accuracy-what-quantization-costs)). An all-Q6_K GGUF runs on the
+5. **Quality option:** done. Q4_K_M costs +3 % perplexity and KLD 0.035 against BF16 on LFM3-1.7B, Q6_K
+   KLD 0.003 ([benchmarks §6](benchmarks.md#6-accuracy-what-quantization-costs)). An all-Q6_K GGUF runs on the
    same GEMV ("quality", now ~12–13 tok/s with the faster 6-bit kernel and padding-free `q6only` tiles) next to
    Q4_K_M ("fast", ~14–15 tok/s); the app should offer both.
 
