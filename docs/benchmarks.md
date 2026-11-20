@@ -99,7 +99,29 @@ exists in the model:
   removes most of it.
 * Estimated LFM3-1.7B 4-bit decode at these rates, one call per projection: ~10 ms conv layers, ~9 ms attention
   projections, ~38 ms FFN (11 of 24 `ffn_down` are Q6_K), ~9.5 ms LM head (Q6_K, tied to `token_embd`), so
-  ~67 ms or **~15 tok/s** before fusing. bf16 with the same scheme is ~7 tok/s. Not yet measured end to end.
+  ~67 ms or **~15 tok/s** before fusing. bf16 with the same scheme is ~7 tok/s. Measured end to end: section 3c.
+
+## 3c. LFM3-1.7B Q4_K_M decode end to end
+
+`xdna1-llm --gguf LFM3-1.7B-Q4_K_M.gguf --generate 24 --compare`: every linear layer and the LM head run on the
+quantized GEMVs; norms, RoPE, attention over the KV cache and the short conv run on the CPU in numpy. The prompt
+is fed one token at a time for now.
+
+| | |
+|---|---|
+| Generation | **8.5 tok/s** |
+| Per token: linear layers | 107 ms in 113 calls, **59 of them on a different context than the call before** |
+| Per token: CPU ops | 8.4 ms |
+| Load (repack Q4_K / Q6_K, upload) | 7.6 s |
+| Logits vs. an fp32 CPU reference on the same weights | cosine 0.99993–0.99999, same top-1 at every step |
+
+* The kernels themselves add up to ~63 ms per token (section 3b). The rest is context switching: the four GEMV
+  contexts (Q4_K and Q6_K, K = 2048 and 7680) alternate inside every layer. One context for all of them is the
+  next step, then fewer calls per layer.
+* llama.cpp's greedy output for the same prompt diverges after a few tokens where two candidates are close.
+  At that step both the fp32 reference and llama.cpp's own prompt evaluation rank our token first; llama.cpp's
+  CPU decode path rounds activations to 8 bits, so its token-by-token output differs slightly from its own
+  batched evaluation.
 
 ## 4. LFM3-1.7B prefill with linears on the NPU
 

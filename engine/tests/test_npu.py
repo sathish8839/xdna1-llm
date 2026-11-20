@@ -1,4 +1,5 @@
-"""On-device tests: need an XDNA1 NPU, pyxrt, and kernels from `kernels/build_kernels.sh <out> engine` / `smoke`."""
+"""On-device tests: need an XDNA1 NPU, pyxrt, and kernels from `kernels/build_kernels.sh <out> engine` / `smoke` /
+`qgemv`."""
 
 import os
 
@@ -43,3 +44,27 @@ def test_npu_linear_matches_cpu(npu):
     y = lin("w", x)
     assert y.shape == (37, 2048)
     np.testing.assert_allclose(y, ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("kind", ["Q4_K", "Q6_K"])
+def test_npu_qlinear_matches_gguf_dequantization(npu, kind):
+    from xdna1_llm import q4k, q6k
+    from xdna1_llm.npu.qlinear import NpuQLinear
+
+    fmt, mod = {"Q4_K": ("q4", q4k), "Q6_K": ("q6", q6k)}[kind]
+    if not os.path.exists(os.path.join(default_kernel_dir(), f"{fmt}_512x2048.bin")):
+        pytest.skip(f"{fmt} GEMV not built (kernels/build_kernels.sh <out> qgemv)")
+    rng = np.random.default_rng(0)
+    n, k = 512, 2048
+    raw = rng.integers(0, 256, size=(n, k // 256, mod.BLOCK_BYTES), dtype=np.uint8)
+    scales = rng.uniform(1e-4, 1e-3, size=(n, k // 256, 2)).astype(np.float16).view(np.uint8)
+    if kind == "Q4_K":
+        raw[..., 0:4] = scales
+    else:
+        raw[..., 208:210] = scales[..., :2]
+    raw = raw.reshape(n, -1)
+    lin = NpuQLinear(npu)
+    lin.register("w", (kind, raw))
+    x = rng.standard_normal((2, k)).astype(np.float32)
+    ref = from_bf16(to_bf16(x)).astype(np.float64) @ mod.dequantize(raw).T.astype(np.float64)
+    np.testing.assert_allclose(lin("w", x), ref, rtol=0, atol=1e-4 * np.abs(ref).max())

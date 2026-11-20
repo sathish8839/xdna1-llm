@@ -45,8 +45,7 @@ That is **1.6× faster and 2.5× less energy than the CPU, with the CPU nearly f
 | NPU kernels compiled with mlir-aie, running on the **Windows** NPU driver | ✅ |
 | Prefill with every linear layer on the NPU (bf16) | ✅ |
 | Native tokenizer, chat template, generation loop | ⏳ next |
-| Decode on the NPU (GEMV kernel, KV cache) | ⏳ |
-| **Q4_K_M** weights on the NPU | ⏳ |
+| **Q4_K_M** decode on the NPU (Q4_K / Q6_K GEMVs, KV cache): 8.5 tok/s, being optimized | ✅ |
 | OpenAI-compatible server (streaming, tool calls) | ⏳ |
 | Windows app (chat, thinking toggle, web search) and installer | ⏳ |
 | Norms, conv, attention and SwiGLU fused on the NPU | ⏳ |
@@ -73,7 +72,8 @@ uv venv --python 3.13 .venv; .venv\Scripts\activate
 uv pip install -e ".[dev]"
 copy <xrt_sdk>\xrt\python\pyxrt.pyd .venv\Lib\site-packages\
 python -m pytest -rs                       # CPU tests, plus NPU tests when kernels are built
-xdna1-llm --gguf LFM3-1.7B-BF16.gguf --llama-server <llama-server.exe> --compare
+xdna1-llm --gguf LFM3-1.7B-BF16.gguf --llama-server <llama-server.exe> --compare               # prefill
+xdna1-llm --gguf LFM3-1.7B-Q4_K_M.gguf --llama-server <llama-server.exe> --generate 24 --compare  # decode
 ```
 
 ## How it works

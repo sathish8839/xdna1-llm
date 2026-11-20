@@ -18,6 +18,10 @@ All notable changes to this project are documented here. The format follows
   streaming-bandwidth probe and benchmarks.
 - One GEMV xclbin per K now serves every N: the tile count travels with the activation, and
   `Kernel.add_program` switches instruction streams inside one context.
+- Decode loop for Q4_K_M: `LFM3.step` with KV cache and short-conv state, `NpuQLinear` running every linear
+  layer and the LM head on the quantized GEMVs, and `xdna1-llm --generate N [--compare]`. 8.5 tok/s, logits
+  within cosine 0.99993 of an fp32 reference.
+- `GGUFWeights.tensor()` / `f32()` read Q4_K and Q6_K tensors; `CpuLinear` takes them too (dequantizing per call).
 - 6-bit GEMV on GGUF Q6_K weights (LM head, part of FFN down, attn_v), lossless repack in `xdna1_llm/q6k.py`;
   the real LM head runs in 9.5 ms. Q4_K and Q6_K share one design script (`qgemv.py`).
 - 4-bit GEMV on GGUF Q4_K weights, repacked losslessly at load (`xdna1_llm/q4k.py`): long rows split across

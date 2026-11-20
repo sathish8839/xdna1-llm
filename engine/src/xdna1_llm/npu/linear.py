@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 
 from ..bf16 import to_bf16
+from ..gguf_weights import as_parts
 from .device import COMPLETED, FROM_DEV, TO_DEV, Npu, mapped
 
 M_TILE, N_CHUNK = 256, 1024
@@ -36,6 +37,8 @@ def default_kernel_dir() -> str:
 
 
 class NpuLinear:
+    wants_head = False  # the LM head stays on the CPU in fp32 for prefill
+
     def __init__(self, npu: Npu | None = None, kernel_dir: str | None = None, ks=SUPPORTED_K):
         self.npu = npu or Npu()
         kdir = kernel_dir or default_kernel_dir()
@@ -60,8 +63,13 @@ class NpuLinear:
         self.npu_ms = 0.0
         self.calls = 0
 
-    def register(self, name: str, wbits: np.ndarray):
-        """wbits: bf16 bits, shape (out, in) as stored in GGUF; out must be a multiple of 1024."""
+    def register(self, name: str, w):
+        """w: bf16 bits, shape (out, in) as stored in GGUF (or BF16 tensors whose rows are stacked); out must be a
+        multiple of 1024."""
+        parts = as_parts(w)
+        if any(kind != "BF16" for kind, _ in parts):
+            raise ValueError(f"{name}: the prefill GEMM engine takes BF16 weights, got {[k for k, _ in parts]}")
+        wbits = np.concatenate([data for _, data in parts], axis=0)
         out, K = wbits.shape
         if out % N_CHUNK or K not in self.k:
             raise ValueError(f"{name}: shape {wbits.shape} needs out % {N_CHUNK} == 0 and in in {tuple(self.k)}")

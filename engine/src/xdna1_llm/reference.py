@@ -80,6 +80,17 @@ class LlamaServer:
         cand = p.get("top_logprobs") or p.get("probs") or []
         return [(c.get("token"), c.get("logprob", c.get("prob", 0.0))) for c in cand]
 
+    def detokenize(self, ids: list[int]) -> str:
+        return self.post("/detokenize", {"tokens": ids})["content"]
+
+    def generate(self, ids: list[int], n: int) -> list[int]:
+        """Greedy continuation as token ids (stops early at end of generation)."""
+        r = self.post(
+            "/completion",
+            {"prompt": ids, "n_predict": n, "temperature": 0, "cache_prompt": False, "return_tokens": True},
+        )
+        return r["tokens"]
+
     def timings(self, ids: list[int], n_predict: int = 16) -> dict:
         return self.post(
             "/completion", {"prompt": ids, "n_predict": n_predict, "temperature": 0, "cache_prompt": False}

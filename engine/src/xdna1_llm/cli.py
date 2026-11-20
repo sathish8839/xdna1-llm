@@ -31,6 +31,7 @@ def main(argv=None):
     ap.add_argument("--server", default="http://127.0.0.1:18080")
     ap.add_argument("--llama-server", help="path to llama-server.exe to start for tokenization/reference")
     ap.add_argument("--kernels", help="directory with built xclbins (default: kernels/build or $XDNA1_LLM_KERNELS)")
+    ap.add_argument("--generate", type=int, metavar="N", help="decode N tokens greedily (Q4_K_M GGUF, NPU GEMVs)")
     a = ap.parse_args(argv)
     if not a.gguf:
         ap.error("--gguf (or XDNA1_LLM_GGUF) is required")
@@ -40,6 +41,8 @@ def main(argv=None):
         print("starting llama-server (CPU only) ...", flush=True)
         srv.start(a.llama_server, a.gguf)
     ids = srv.tokenize(a.prompt)
+    if a.generate:
+        return generate(a, srv, ids)
     if len(ids) > M_TILE:
         print(f"prompt has {len(ids)} tokens; keeping the last {M_TILE} (single-tile prefill)")
         ids = ids[-M_TILE:]
@@ -84,6 +87,53 @@ def main(argv=None):
     print("[llama.cpp] top-5 next: " + ", ".join(f"{t!r}({p:.2f})" for t, p in srv.top_next(ids)))
     srv.stop()
     if "npu" in backends:
+        from .npu.device import hard_exit
+
+        hard_exit(0)
+
+
+def generate(a, srv, ids):
+    """Decode on the NPU (or the CPU reference) and compare the tokens with llama.cpp's greedy output."""
+    w = GGUFWeights(a.gguf)
+    if a.backend == "npu":
+        from .npu.qlinear import NpuQLinear  # imports pyxrt
+
+        lin = NpuQLinear(kernel_dir=a.kernels)
+    else:
+        lin = CpuLinear()
+    m = LFM3(w, lin)
+    repack = f" (repack {lin.repack_s:.1f} s)" if a.backend == "npu" else ""
+    print(f"[{a.backend}] weights ready in {m.load_s:.1f} s{repack}; prompt {len(ids)} tokens", flush=True)
+
+    m.cpu_ms, lin.npu_ms, lin.calls = 0.0, 0.0, 0
+    logits = []
+    dot = lambda t: print(".", end="", flush=True)  # noqa: E731
+    out, st, t_prompt, t_gen = m.generate(ids, a.generate, on_token=dot, logits_out=logits)
+    n_steps = len(ids) + len(out) - 1
+    switches = f", {lin.switches / n_steps:.0f} context switches" if a.backend == "npu" else ""
+    print(f"\n[{a.backend}] {srv.detokenize(out)!r}")
+    print(
+        f"[{a.backend}] prompt {len(ids) / t_prompt:.1f} tok/s, generation {(len(out) - 1) / t_gen:.1f} tok/s; "
+        f"per token: linears {lin.npu_ms / n_steps:.1f} ms in {lin.calls / n_steps:.0f} calls{switches}, "
+        f"cpu ops {m.cpu_ms / n_steps:.1f} ms"
+    )
+    if a.compare and a.backend == "npu":  # the exact fp32 CPU reference along the same tokens
+        cpu = LFM3(w, CpuLinear())
+        cst = cpu.new_state(st.max_len)
+        for t in ids[:-1]:
+            cpu.step(int(t), cst)
+        path = [ids[-1], *out[:-1]]
+        for i, t in enumerate(path):
+            ref_logits = cpu.step(int(t), cst)
+            cs = float(logits[i] @ ref_logits / (np.linalg.norm(logits[i]) * np.linalg.norm(ref_logits)))
+            same = int(np.argmax(logits[i])) == int(np.argmax(ref_logits))
+            print(f"  token {i}: logits cosine vs fp32 CPU {cs:.6f}, same top-1 {same}", flush=True)
+    ref = srv.generate(ids, a.generate)
+    print(f"[llama.cpp] {srv.detokenize(ref)!r}")
+    same = next((i for i, (x, y) in enumerate(zip(out, ref, strict=False)) if x != y), min(len(out), len(ref)))
+    print(f"first {same} of {len(ref)} tokens identical to llama.cpp")
+    srv.stop()
+    if a.backend == "npu":
         from .npu.device import hard_exit
 
         hard_exit(0)

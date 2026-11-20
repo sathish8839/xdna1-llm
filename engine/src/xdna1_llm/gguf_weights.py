@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 from gguf import GGUFReader
 
+from . import q4k, q6k
 from .bf16 import from_bf16
 
 
@@ -47,15 +48,41 @@ class GGUFWeights:
             return np.asarray(t.data).view(np.uint16).reshape(shape)
         if kind == "F32":
             return np.asarray(t.data, dtype=np.float32).reshape(shape)
-        raise NotImplementedError(
-            f"{name}: tensor type {kind} not supported yet (BF16/F32 only; Q4_K support is on the roadmap)"
-        )
+        raise NotImplementedError(f"{name}: {kind} is quantized; use tensor() or f32()")
 
     def quant(self, name: str) -> tuple[str, np.ndarray]:
         """A quantized tensor as (type name, uint8 (rows, bytes per row)), still in GGUF block format."""
         t = self.tensors[name]
         return t.tensor_type.name, np.asarray(t.data).view(np.uint8).reshape(int(t.shape[-1]), -1)
 
+    def tensor(self, name: str) -> tuple[str, np.ndarray]:
+        """A 2D weight as (type, data): BF16 as bf16 bits (out, in), Q4_K / Q6_K as GGUF blocks (out, bytes)."""
+        kind = self.tensors[name].tensor_type.name
+        return (kind, self.raw(name)) if kind in ("BF16", "F32") else self.quant(name)
+
     def f32(self, name: str) -> np.ndarray:
-        a = self.raw(name)
-        return from_bf16(a) if a.dtype == np.uint16 else a
+        """Any supported tensor as float32 (quantized ones dequantized), numpy shape (ne1, ne0)."""
+        return dequantize(*self.tensor(name))
+
+
+def dequantize(kind: str, data: np.ndarray) -> np.ndarray:
+    """(type, data) from GGUFWeights.tensor -> float32 (out, in)."""
+    if kind == "BF16":
+        return from_bf16(data)
+    if kind == "F32":
+        return data
+    if kind == "Q4_K":
+        return q4k.dequantize(data)
+    if kind == "Q6_K":
+        return q6k.dequantize(data)
+    raise NotImplementedError(f"tensor type {kind} not supported (BF16, F32, Q4_K, Q6_K)")
+
+
+def as_parts(w) -> list[tuple[str, np.ndarray]]:
+    """A weight given to a linear backend: bf16 bits, one (type, data) tensor, or a list of tensors whose rows
+    are stacked (for example k and v)."""
+    if isinstance(w, np.ndarray):
+        return [("BF16", w)]
+    if isinstance(w, tuple):
+        return [w]
+    return list(w)

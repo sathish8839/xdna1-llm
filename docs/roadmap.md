@@ -50,8 +50,10 @@ These come from measurements in [benchmarks.md](benchmarks.md):
 * **Quantized GEMVs** (`kernels/designs/qgemv.py`): read Q4_K and Q6_K repacked at load (`xdna1_llm/q4k.py`,
   `q6k.py`), every LFM3 Q4_K_M tensor shape including FFN down (K = 7680) and the 128000-row LM head,
   ~1e-4 from the GGUF dequantization. Remaining: fewer dispatches, a faster 6-bit unpack.
-* State in NPU-visible buffers across calls: the KV cache for the 11 attention layers (bf16, 4 KV heads × 128)
-  and a 6-token rolling buffer for each of the 13 short-conv layers.
+* **Decode loop**: done for Q4_K_M (`LFM3.step` / `generate`, `xdna1-llm --generate`), 8.5 tok/s, logits
+  within cosine 0.99993 of an fp32 reference. KV cache and short-conv state live on the CPU for now.
+* Next: one context for all quantized GEMVs (today 59 context switches per token cost more than the kernels),
+  then fewer calls per layer, a batched prompt path, and state in NPU-visible buffers.
 
 ## M4: Q4_K_M on the NPU
 
