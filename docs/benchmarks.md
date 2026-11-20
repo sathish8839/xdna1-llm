@@ -79,6 +79,31 @@ exists in the model:
 | FFN down 2048×7680 | 13.4 MB | 0.81–0.86 ms | 18.8 G/s | 1e-5 |
 | LM head (`token_embd`) 128000×2048 | 223 MB | **9.5 ms** | **27.5 G/s** | 2e-5 |
 
+Faster 6-bit kernel (current; real tensors from an all-Q6_K GGUF; the machine's speed varies by ~10 % between
+runs, so ranges are given):
+
+| Q6_K shape (N×K) | before | unified tiles | q6only tiles (no padding) |
+|---|---|---|---|
+| conv out 2048×2048 | 0.31 ms | 0.28 ms | 0.28–0.31 ms |
+| conv in_proj 6144×2048 | 0.65 ms | 0.53–0.55 ms | **0.49 ms** |
+| FFN down 2048×7680 | 0.79 ms | **0.63–0.65 ms** | same (K = 7680 has no padding either way) |
+| FFN gate+up 15360×2048 (random) | 1.32 ms | 1.09–1.14 ms | **1.02–1.12 ms** |
+| LM head 128000×2048 | 9.9 ms | 8.1–8.9 ms | **7.5–7.6 ms** (35 G weights/s) |
+| Q4_K FFN gate+up 15360×2048 | 0.85 ms | 0.77 ms | — |
+| Q4_K FFN down 2048×7680 | 0.54 ms | 0.50 ms | — |
+
+* The old loop took 111 instruction bundles per 256 weights but issued only ~170 operations: it waited on
+  latency, not on the MAC unit. 8-bit shifts compile to accumulator round trips (`vups` / `vsrs`), each x value
+  was extracted from a vector register before broadcasting, and a group's 8 MACs formed one dependent chain.
+  Now: masks on full 64-byte vectors, bytes to bf16 with one shuffle (zip with `0x43`), x read as scalars from
+  memory, 4 independent accumulators per group, and the group loop unrolled twice (99 bundles, two groups
+  overlapping). Q4_K shares the helpers and gains ~10 %.
+* Once compute caught up, the 12.5 % padding of K = 2048 Q6_K rows (768-column tiles) showed up again in the big
+  shapes. All-Q6_K models therefore use a second build, `q6only`: 512-column, 7296-byte tiles, which divide
+  K = 2048 and 7680 exactly. Q4_K_M models keep the unified build, so they still run in one context.
+* Results are unchanged: max relative error vs the GGUF dequantization as before, and the accuracy gate passes
+  (KLD 0.00005 for Q6_K, 0.0001 for Q4_K_M against their CPU runs).
+
 * bf16 matches numpy to ~2e-7. The quantized kernels are checked against an fp64 product with the GGUF
   dequantization (`gguf.quants`); the remaining ~1e-4 is fp32 rounding.
 * Switching instruction streams inside one context costs nothing: alternating 2048- and 15360-row calls takes
@@ -90,13 +115,12 @@ exists in the model:
   trick (`0x4300 | q` = 128 + q). AIE2 emulates fp32 multiplies, so every scaling step uses native bf16 MACs on
   high/low bf16 parts: that change alone took the kernel from 17.5 to 35 G weights/s.
 * 6-bit layout: Q6_K's low 4 bits are stored like the Q4_K nibbles and its high 2 bits packed four per byte in
-  the lane order the nibble vectors already use, so merging them is a few byte-wise shifts and masks; the int8
-  group scales and the fp16 scale are stored as in the 4-bit layout (7.1 bits per weight; the GGUF file is 6.56).
-  The extra unpacking makes the 6-bit kernel compute-bound at mid sizes (16 GB/s on FFN down) while the LM head
-  streams at 23 GB/s.
+  the lane order of a group's two 64-byte nibble vectors, so merging them is a few byte-wise shifts and masks;
+  the int8 group scales and the fp16 scale are stored as in the 4-bit layout (7.1 bits per weight; the GGUF
+  file is 6.56).
 * Rows are split into fixed-size tiles (10.9 KB: 1024 Q4_K or 768 Q6_K columns), so one core program handles
-  both formats and every K; the last tile of a row may be partly used (Q4_K pads under 2 %, the Q6_K LM head
-  12 %). The core keeps the partial sums between a row's tiles, and each 16-row block's outputs stream back as
+  both formats and every K; the last tile of a row may be partly used (Q4_K pads under 2 %, K = 2048 Q6_K rows
+  12.5 %; all-Q6_K models use 7.3 KB, 512-column tiles with no padding). The core keeps the partial sums between a row's tiles, and each 16-row block's outputs stream back as
   soon as they are done, so N is not limited by core memory. The tables above are from the earlier per-format
   builds; the merged kernel is within ~5 % (LM head 10.0 ms).
 * Each call carries ~0.15–0.2 ms of fixed cost, which is why small shapes reach less. Fusing calls per layer
@@ -204,13 +228,16 @@ quantizations:
 * **Q6_K is close to lossless** (KLD 10× lower, perplexity within noise of BF16) for 30 % more bytes, and runs
   on the same decode GEMV and context (four more instruction streams: 2048, 3072, 6144 and 15360 × 2048).
 
-| Decode on the NPU (32 tokens, two runs each) | file | generation | linears per token | logits vs BF16 (KLD) |
+| Decode on the NPU (32–64 tokens) | file | generation | linears per token | logits vs BF16 (KLD) |
 |---|---|---|---|---|
-| Q4_K_M ("fast") | 1.10 GB | 13.5–13.7 tok/s | 68 ms, 102 calls | 0.057 |
-| Q6_K ("quality") | 1.43 GB | 10.6–10.9 tok/s | 86–88 ms, 97 calls | 0.006 |
+| Q4_K_M ("fast"), first 6-bit kernel | 1.10 GB | 13.5–13.7 tok/s | 68 ms, 102 calls | 0.057 |
+| Q6_K ("quality"), first 6-bit kernel | 1.43 GB | 10.6–10.9 tok/s | 86–88 ms, 97 calls | 0.006 |
+| Q4_K_M, faster kernel | | **14.1–14.9 tok/s** | 61.5–64 ms | 0.057 |
+| Q6_K, faster kernel, q6only tiles | | **12.1–13.2 tok/s** | 72–75.5 ms | 0.006 |
 
-  Q6_K needs fewer calls (q, k and v are one format, so one call) but its kernel streams ~19–28 G weights/s
-  against Q4_K's ~27–44, so a faster 6-bit unpack speeds up both models.
+  The laptop also has a slower state (CPU ops double from ~5.5 to ~10 ms, and the NPU calls slow down too) in
+  which the same builds give 12.4 (Q4_K_M) and 10.2–10.9 tok/s (Q6_K); the table compares runs in the normal
+  state.
 * 1,440 tokens is small: differences under ~1 % perplexity are noise. Q6_K / Q8_0 were made locally from the
   BF16 GGUF with `llama-quantize` (no imatrix).
 

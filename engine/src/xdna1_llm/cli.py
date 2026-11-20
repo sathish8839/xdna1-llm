@@ -103,11 +103,11 @@ def generate(a, srv, ids):
     if a.backend == "npu":
         from .npu.qlinear import NpuQLinear  # imports pyxrt
 
-        lin = NpuQLinear(kernel_dir=a.kernels)
+        lin = NpuQLinear(kernel_dir=a.kernels, formats=w.types())
     else:
         lin = CpuLinear()
     m = LFM3(w, lin)
-    repack = f" (repack {lin.repack_s:.1f} s)" if a.backend == "npu" else ""
+    repack = f" (repack {lin.repack_s:.1f} s, {lin.geo.name} tiles)" if a.backend == "npu" else ""
     print(f"[{a.backend}] weights ready in {m.load_s:.1f} s{repack}; prompt {len(ids)} tokens", flush=True)
 
     m.cpu_ms, lin.npu_ms, lin.calls = 0.0, 0.0, 0

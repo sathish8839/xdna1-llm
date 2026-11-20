@@ -37,6 +37,10 @@ class GGUFWeights:
         return [bytes(f.parts[i]).decode("utf-8", "replace") for i in f.data]
 
     # ---- tensors
+    def types(self) -> set[str]:
+        """Tensor types in the file, for example {"F32", "Q4_K", "Q6_K"} for a Q4_K_M model."""
+        return {t.tensor_type.name for t in self.tensors.values()}
+
     def has(self, name: str) -> bool:
         return name in self.tensors
 

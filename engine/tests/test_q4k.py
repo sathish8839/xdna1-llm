@@ -58,3 +58,6 @@ def test_x_input_header():
     assert buf.size == 2 * q4k.TILE_BYTES
     np.testing.assert_array_equal(buf[:1024].view(np.uint16), x)
     assert buf[-16:].view(np.int32).tolist() == [2048 // 8 // 16, 1, 6, 512]
+    buf = q4k.x_input(x, 6, 2048, 512, q4k.Q6ONLY)  # x (up to 15 KB) needs three 7296-byte tiles
+    assert buf.size == 3 * q4k.Q6ONLY.tile
+    assert buf[-16:].view(np.int32).tolist() == [2048 // 8 // 16, 1, 6, 512]

@@ -18,6 +18,9 @@ All notable changes to this project are documented here. The format follows
   streaming-bandwidth probe and benchmarks.
 - One GEMV xclbin per K now serves every N: the tile count travels with the activation, and
   `Kernel.add_program` switches instruction streams inside one context.
+- Faster quantized GEMV: 64-byte bit masks, bytes to bf16 by one shuffle, x read from memory, independent
+  accumulators and a twice-unrolled group loop (Q6_K GEMVs 15–25 % faster, Q4_K ~10 %). All-Q6_K models use
+  a padding-free `q6only` tile geometry. Decode: Q6_K ~11 → ~12–13 tok/s, Q4_K_M ~14 → ~14–15 tok/s.
 - Q6_K "quality" model: an all-Q6_K GGUF decodes on the same NPU GEMV at ~11 tok/s with KLD 0.006 against
   BF16 (Q4_K_M: ~14 tok/s, KLD 0.056). The CLI warns when a running llama-server holds a different model.
 - Accuracy harness (`benchmarks/eval_quality.py`, `xdna1_llm.quality`): perplexity, KL divergence and top-1

@@ -16,17 +16,17 @@ def random_q6k(n: int, k: int, seed: int = 0) -> np.ndarray:
     return raw.reshape(n, -1)
 
 
-def unpack_tiles(tiles: np.ndarray, n: int, k: int) -> np.ndarray:
+def unpack_tiles(tiles: np.ndarray, n: int, k: int, geo=q4k.UNIFIED) -> np.ndarray:
     """Read the kernel's tile layout back into float weights (what qgemv.cc computes, in numpy)."""
-    KC, nc = q6k.layout(k)
+    KC, nc = q6k.layout(k, geo)
     RB, kp = q6k.RB, nc * KC
-    t = tiles.reshape(n // RB, nc, q4k.TILE_BYTES)
+    t = tiles.reshape(n // RB, nc, geo.tile)
     nib = t[..., : KC * 8].reshape(*t.shape[:2], KC // 2, RB)
     lo = np.stack([nib & 0x0F, nib >> 4], axis=-1)  # (block, chunk, k pair, row, k in pair)
     lo = lo.transpose(0, 3, 1, 2, 4).reshape(n, kp)
-    hb = t[..., KC * 8 : KC * 12].reshape(*t.shape[:2], KC // 8, 2, RB)  # (block, chunk, 8k, side, row)
-    h = np.stack([(hb >> s) & 3 for s in (0, 2, 4, 6)], axis=-1).reshape(*hb.shape, 2, 2)  # (.., quad, k in pair)
-    h = h.transpose(0, 4, 1, 2, 5, 3, 6).reshape(n, kp)  # (block, row, chunk, 8k, quad, side, k in pair)
+    hb = t[..., KC * 8 : KC * 12].reshape(*t.shape[:2], KC // 16, 4, RB)  # (block, chunk, group, j, row)
+    h = np.stack([(hb >> s) & 3 for s in (0, 2, 4, 6)], axis=-1).reshape(*hb.shape, 2, 2)  # (.., half, k in pair)
+    h = h.transpose(0, 4, 1, 2, 5, 3, 6).reshape(n, kp)  # (block, row, chunk, group, half, j, k in pair)
     q = lo | (h << 4)
     rest = t[..., KC * 12 :].copy().view(np.uint16)
     ng = KC // q6k.G
@@ -47,8 +47,14 @@ def test_dequantize_matches_gguf():
     np.testing.assert_array_equal(q6k.dequantize(raw), ref)
 
 
+@pytest.mark.parametrize("geo", q4k.GEOMETRIES, ids=lambda g: g.name)
 @pytest.mark.parametrize("k", [512, 2048, 7680])
-def test_repack_is_lossless(k):
+def test_repack_is_lossless(k, geo):
     n = 32
     raw = random_q6k(n, k, seed=k)
-    np.testing.assert_array_equal(unpack_tiles(q6k.repack(raw), n, k), q6k.dequantize(raw))
+    np.testing.assert_array_equal(unpack_tiles(q6k.repack(raw, geo), n, k, geo), q6k.dequantize(raw))
+
+
+def test_q6only_tiles_have_no_padding():
+    assert q6k.repack(random_q6k(16, 2048), q4k.Q6ONLY).size == 4 * q4k.Q6ONLY.tile
+    assert q6k.layout(7680, q4k.Q6ONLY) == (512, 15)

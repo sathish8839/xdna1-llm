@@ -9,7 +9,10 @@ x travels on the same lane ahead of the weights, with a header (blocks, tiles pe
 program depends on nothing: every build has the same cores, and one context runs every format and shape; only
 the instruction stream (the host-side DMA program, sized by -Q -N -K) differs per matrix.
 
-    python qgemv.py --dev npu -Q 4 -N 2048 -K 2048 --xclbin-path X --insts-path Y
+    python qgemv.py --dev npu -Q 4 -N 2048 -K 2048 [--geometry q6only] --xclbin-path X --insts-path Y
+
+--geometry picks the tile size (xdna1_llm.q4k.Geometry): `unified` serves both formats in one program, `q6only`
+uses 512-column Q6_K tiles with no padding for LFM3's K = 2048 and 7680.
 """
 
 import argparse
@@ -27,28 +30,34 @@ from aie.utils.hostruntime.cli import run_design_cli
 from ml_dtypes import bfloat16
 
 LANES, RB = 8, 16  # lanes, rows per block
-TILE_BYTES, K_MAX = 10944, 7680  # must match qgemv.cc
-KC = {4: 1024, 6: 768}  # columns per tile for Q4_K / Q6_K
+K_MAX = 7680  # must match qgemv.cc
+# geometry -> (tile bytes, columns per tile for Q4_K, for Q6_K); must match xdna1_llm.q4k.GEOMETRIES
+GEOMETRIES = {"unified": (10944, 1024, 768), "q6only": (7296, 512, 512)}
 SRC = str(Path(__file__).parent / "qgemv.cc")
 
 
 @iron.jit
-def qgemv(W: In, X: In, Y: Out, *, Q: CompileTime[int], N: CompileTime[int], K: CompileTime[int]):
-    assert Q in KC and N % (LANES * RB) == 0 and K % 256 == 0 and K <= K_MAX, (Q, N, K)
-    n_tiles = -(-K // KC[Q])
+def qgemv(W: In, X: In, Y: Out, *, Q: CompileTime[int], N: CompileTime[int], K: CompileTime[int], G: CompileTime[str]):
+    tile_bytes, kc4, kc6 = GEOMETRIES[G]
+    assert Q in (4, 6) and N % (LANES * RB) == 0 and K % 256 == 0 and K <= K_MAX, (Q, N, K)
+    n_tiles = -(-K // (kc4 if Q == 4 else kc6))
+    x_tiles = -(-2 * K_MAX // tile_bytes)
+    geo = [] if G == "unified" else [f"-DTILE_BYTES={tile_bytes}", f"-DKC4={kc4}", f"-DKC6={kc6}"]
 
     u8 = np.dtype[np.uint8]
-    tile_ty = np.ndarray[(TILE_BYTES,), u8]
+    tile_ty = np.ndarray[(tile_bytes,), u8]
     x_ty = np.ndarray[(K_MAX,), np.dtype[bfloat16]]
     hdr_ty = np.ndarray[(2,), np.dtype[np.int32]]
     y_ty = np.ndarray[(RB,), np.dtype[np.float32]]
     load_x = ExternalFunction(
-        "qg_load_x", source_file=SRC, arg_types=[tile_ty, x_ty, hdr_ty], compile_flags=["-DQG_FN=0"]
+        "qg_load_x", source_file=SRC, arg_types=[tile_ty, x_ty, hdr_ty], compile_flags=["-DQG_FN=0", *geo]
     )
-    rows = ExternalFunction("qg_rows", source_file=SRC, arg_types=[tile_ty, x_ty, y_ty], compile_flags=["-DQG_FN=1"])
+    rows = ExternalFunction(
+        "qg_rows", source_file=SRC, arg_types=[tile_ty, x_ty, y_ty], compile_flags=["-DQG_FN=1", *geo]
+    )
 
     def core_fn(of_in, of_out, xbuf, hdr, load_x, rows):
-        for _ in range_(2):  # x and the header
+        for _ in range_(x_tiles):  # x and the header
             t = of_in.acquire(1)
             load_x(t, xbuf, hdr)
             of_in.release(1)
@@ -71,7 +80,7 @@ def qgemv(W: In, X: In, Y: Out, *, Q: CompileTime[int], N: CompileTime[int], K: 
         hdr = Buffer(type=hdr_ty, name=f"h{lane}")
         workers.append(Worker(core_fn, [fin.cons(), fout.prod(), xbuf, hdr, load_x, rows], tile=Tile(col=col, row=row)))
 
-    n_bytes = N // RB * n_tiles * TILE_BYTES
+    n_bytes = N // RB * n_tiles * tile_bytes
     w_taps = TensorAccessPattern.full((n_bytes,)).partition(LANES)
     y_taps = TensorAccessPattern.full((N,)).partition(LANES)
 
@@ -82,7 +91,7 @@ def qgemv(W: In, X: In, Y: Out, *, Q: CompileTime[int], N: CompileTime[int], K: 
         for i in range(LANES):
             out_hs[i].drain(y, y_taps[i], wait=True)
 
-    x_all = np.ndarray[(2 * TILE_BYTES,), u8]
+    x_all = np.ndarray[(x_tiles * tile_bytes,), u8]
     rt = Runtime(sequence, [np.ndarray[(n_bytes,), u8], x_all, np.ndarray[(N,), np.dtype[np.float32]], ins, outs])
     return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
 
@@ -90,14 +99,15 @@ def qgemv(W: In, X: In, Y: Out, *, Q: CompileTime[int], N: CompileTime[int], K: 
 def main():
     p = argparse.ArgumentParser(prog="qgemv")
     add_compile_args(p)
-    p.add_argument("-Q", type=int, choices=sorted(KC), required=True)
+    p.add_argument("-Q", type=int, choices=(4, 6), required=True)
+    p.add_argument("--geometry", choices=sorted(GEOMETRIES), default="unified")
     p.add_argument("-N", type=int, required=True)
     p.add_argument("-K", type=int, required=True)
     opts = p.parse_args()
     run_design_cli(
         qgemv,
         opts,
-        compile_kwargs=lambda o: dict(Q=o.Q, N=o.N, K=o.K),
+        compile_kwargs=lambda o: dict(Q=o.Q, N=o.N, K=o.K, G=o.geometry),
         run_and_verify=lambda o: None,
         device=lambda o: device_from_args(o, n_cols=4),
     )

@@ -46,16 +46,20 @@ def test_npu_linear_matches_cpu(npu):
     np.testing.assert_allclose(y, ref, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("kind", ["Q4_K", "Q6_K"])
-def test_npu_qlinear_matches_gguf_dequantization(npu, kind):
+@pytest.mark.parametrize(
+    ("kind", "geometry", "n"), [("Q4_K", "unified", 512), ("Q6_K", "unified", 512), ("Q6_K", "q6only", 2048)]
+)
+def test_npu_qlinear_matches_gguf_dequantization(npu, kind, geometry, n):
     from xdna1_llm import q4k, q6k
     from xdna1_llm.npu.qlinear import NpuQLinear
 
-    fmt, mod = {"Q4_K": ("q4", q4k), "Q6_K": ("q6", q6k)}[kind]
-    if not os.path.exists(os.path.join(default_kernel_dir(), f"{fmt}_512x2048.bin")):
-        pytest.skip(f"{fmt} GEMV not built (kernels/build_kernels.sh <out> qgemv)")
+    mod = {"Q4_K": q4k, "Q6_K": q6k}[kind]
+    geo = {g.name: g for g in q4k.GEOMETRIES}[geometry]
+    k = 2048
+    prog = geo.program(4 if kind == "Q4_K" else 6, n, k)
+    if not os.path.exists(os.path.join(default_kernel_dir(), prog + ".bin")):
+        pytest.skip(f"{prog} not built (kernels/build_kernels.sh <out> qgemv)")
     rng = np.random.default_rng(0)
-    n, k = 512, 2048
     raw = rng.integers(0, 256, size=(n, k // 256, mod.BLOCK_BYTES), dtype=np.uint8)
     scales = rng.uniform(1e-4, 1e-3, size=(n, k // 256, 2)).astype(np.float16).view(np.uint8)
     if kind == "Q4_K":
@@ -63,7 +67,8 @@ def test_npu_qlinear_matches_gguf_dequantization(npu, kind):
     else:
         raw[..., 208:210] = scales[..., :2]
     raw = raw.reshape(n, -1)
-    lin = NpuQLinear(npu)
+    lin = NpuQLinear(npu, formats={kind} if geometry == "q6only" else None)
+    assert lin.geo is geo
     lin.register("w", (kind, raw))
     x = rng.standard_normal((2, k)).astype(np.float32)
     ref = from_bf16(to_bf16(x)).astype(np.float64) @ mod.dequantize(raw).T.astype(np.float64)

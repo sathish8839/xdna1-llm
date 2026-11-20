@@ -93,13 +93,17 @@ if [[ "$SET" == gemv || "$SET" == all ]]; then
   done
 fi
 if [[ "$SET" == qgemv || "$SET" == all ]]; then
-  # every build has the same cores (one context runs them all); each matrix shape needs its instruction stream
-  for shape in 512x2048 2048x2048 2560x2048 3072x2048 6144x2048 15360x2048 2048x7680; do  # Q4_K tensors
+  # every build of a geometry has the same cores (one context runs them all); each shape needs its instruction
+  # stream. Unified geometry, Q4_K_M models: Q4_K tensors, then Q6_K attn_v, LM head and ffn_down
+  for shape in 512x2048 2048x2048 2560x2048 3072x2048 6144x2048 15360x2048 2048x7680; do
     design "q4_$shape" qgemv.py -Q 4 -N "${shape%x*}" -K "${shape#*x}"
   done
-  # Q6_K: attn_v, LM head and ffn_down in Q4_K_M; every tensor of an all-Q6_K model ("quality")
-  for shape in 512x2048 2048x2048 3072x2048 6144x2048 15360x2048 128000x2048 2048x7680; do
+  for shape in 512x2048 128000x2048 2048x7680; do
     design "q6_$shape" qgemv.py -Q 6 -N "${shape%x*}" -K "${shape#*x}"
+  done
+  # q6only geometry (no padding), all-Q6_K models: every tensor
+  for shape in 2048x2048 3072x2048 6144x2048 15360x2048 128000x2048 2048x7680; do
+    design "q6only_$shape" qgemv.py -Q 6 -N "${shape%x*}" -K "${shape#*x}" --geometry q6only
   done
 fi
 if [[ "$SET" == bw || "$SET" == all ]]; then

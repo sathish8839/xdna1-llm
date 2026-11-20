@@ -79,7 +79,8 @@ def evaluate():
     if a.npu:
         from xdna1_llm.npu.qlinear import NpuQLinear  # imports pyxrt
 
-        variants[first + "-npu"] = (LFM3(variants[first][0].w, NpuQLinear(kernel_dir=a.kernels)), decode_logits)
+        w = variants[first][0].w
+        variants[first + "-npu"] = (LFM3(w, NpuQLinear(kernel_dir=a.kernels, formats=w.types())), decode_logits)
         pairs += [(first + "-npu", "bf16"), (first + "-npu", first)]
     scores = {p: Score() for p in pairs}
 

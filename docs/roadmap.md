@@ -57,8 +57,10 @@ These come from measurements in [benchmarks.md](benchmarks.md) (the last one is 
   within cosine 0.99993 of an fp32 reference. KV cache and short-conv state live on the CPU for now.
 * One context for every quantized GEMV (format and sizes travel with the data): done, 8.5 → 11–12 tok/s.
 * q/k/v as one call, completion polling instead of a sleeping wait: done, 11–12 → ~14 tok/s.
-* Next: a faster Q6_K path (a third of the kernel time), a batched prompt path, then the CPU ops between calls
-  on the NPU (M7) so a layer needs fewer round trips.
+* Faster 6-bit kernel: done (Q6_K GEMVs 15–25 % faster, Q4_K ~10 %; all-Q6_K models stream no padding).
+* Next: a batched prompt path, then the CPU ops between calls on the NPU (M7) so a layer needs fewer round trips.
+  The GEMV loop still waits on latency more than on the MAC unit (broadcasting x is the largest remaining cost);
+  32-row blocks would share each broadcast between two MACs.
 
 ## M4: Q4_K_M on the NPU
 
@@ -79,7 +81,8 @@ GGUF Q4_K_M mixes **Q4_K** (most tensors) and **Q6_K** (for LFM3-1.7B: `token_em
 4. Q6_K: same structure with a 6-bit unpack. Done for decode (`kernels/designs/qgemv.cc`).
 5. **Quality option:** done. Q4_K_M costs +6 % perplexity and KLD 0.056 against BF16 on LFM3-1.7B, Q6_K
    KLD 0.006 ([benchmarks §6](benchmarks.md#6-accuracy-what-quantization-costs)). An all-Q6_K GGUF runs on the
-   same GEMV at ~11 tok/s ("quality") next to Q4_K_M at ~14 tok/s ("fast"); the app should offer both.
+   same GEMV ("quality", now ~12–13 tok/s with the faster 6-bit kernel and padding-free `q6only` tiles) next to
+   Q4_K_M ("fast", ~14–15 tok/s); the app should offer both.
 
 ## M5–M6: server, app, installer
 

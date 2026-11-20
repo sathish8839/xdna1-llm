@@ -41,22 +41,22 @@ def dequantize(raw: np.ndarray) -> np.ndarray:
     return np.repeat(s, G, axis=1) * (q.astype(np.float32) - 32)
 
 
-def layout(K: int) -> tuple[int, int]:
+def layout(K: int, geo: q4k.Geometry = q4k.UNIFIED) -> tuple[int, int]:
     """(columns per tile, tiles per 16-row block)."""
-    return q4k.layout(K, 6)
+    return q4k.layout(K, 6, geo)
 
 
-def repack(raw: np.ndarray) -> np.ndarray:
+def repack(raw: np.ndarray, geo: q4k.Geometry = q4k.UNIFIED) -> np.ndarray:
     """Q6_K rows, uint8 (N, K/256*210) -> kernel tiles, ordered (16-row block, k chunk). Each tile:
     low nibbles: per k pair, 16 bytes (row i: q[2p] & 15 | (q[2p+1] & 15) << 4), as in the Q4_K tiles
-    high bits:   per 8 k, 32 bytes; byte i (row i % 16, side s = i // 16) holds the high 2 bits of
-                 k = 2s, 2s+1, 2s+4, 2s+5 in bits 0-1, 2-3, 4-5, 6-7
+    high bits:   per 16 k, 64 bytes; byte i (row i % 16, j = i // 16) holds the high 2 bits of
+                 k = 2j, 2j+1, 8+2j, 9+2j in bits 0-1, 2-3, 4-5, 6-7 (the lane order of 64-byte nibble loads)
     scales:      per 16 k, sc for 16 rows (bf16, exact)
     super-block: d_hi, d_lo for 16 rows (bf16, d_hi + d_lo == d exactly)
     then zero padding to the tile size. Columns past K are zero."""
     q, sc, d = unpack(raw)
     N, K = q.shape
-    KC, nc = layout(K)
+    KC, nc = layout(K, geo)
     pad = nc * KC - K
     q = np.pad(q, ((0, 0), (0, pad)))
     sc = np.pad(sc, ((0, 0), (0, pad // G)))
@@ -66,10 +66,10 @@ def repack(raw: np.ndarray) -> np.ndarray:
     qb = q.reshape(nb, RB, nc, KC // 2, 2) & 0x0F
     nib = (qb[..., 0] | (qb[..., 1] << 4)).astype(np.uint8).transpose(0, 2, 3, 1)  # (block, chunk, k pair, row)
 
-    h = (q >> 4).reshape(nb, RB, nc, KC // 8, 2, 2, 2)  # (block, row, chunk, 8k, quad, side, k in pair)
+    h = (q >> 4).reshape(nb, RB, nc, KC // 16, 2, 4, 2)  # (block, row, chunk, group, half, j, k in pair)
     hb = h[..., 0, :, 0] | (h[..., 0, :, 1] << 2) | (h[..., 1, :, 0] << 4) | (h[..., 1, :, 1] << 6)
-    hb = hb.astype(np.uint8).transpose(0, 2, 3, 4, 1)  # (block, chunk, 8k, side, row)
+    hb = hb.astype(np.uint8).transpose(0, 2, 3, 4, 1)  # (block, chunk, group, j, row)
 
     scv = q4k.rows_last([to_bf16(sc.astype(np.float32))], nb, nc, KC // G)
     dd = q4k.rows_last([*q4k._hi_lo(d)], nb, nc, KC // QK)
-    return q4k.pad_tiles([nib.reshape(nb, nc, -1), hb.reshape(nb, nc, -1), scv, dd])
+    return q4k.pad_tiles([nib.reshape(nb, nc, -1), hb.reshape(nb, nc, -1), scv, dd], geo)

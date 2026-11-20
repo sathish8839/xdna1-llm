@@ -2,6 +2,7 @@
 
     python benchmarks/bench_qgemv.py <kernel_dir> q4_2048x2048 q4_15360x2048 q6_2048x7680
     python benchmarks/bench_qgemv.py <kernel_dir> --gguf model.gguf blk.0.ffn_gate.weight blk.0.ffn_down.weight
+    python benchmarks/bench_qgemv.py <kernel_dir> --geometry q6only q6_2048x7680   # all-Q6_K tile geometry
 
 Shapes (q4_NxK / q6_NxK) use random blocks; --gguf uses real tensors (Q4_K or Q6_K). Results are checked
 against the fp64 product with the GGUF dequantization. One context runs every shape; each runs through its own
@@ -35,6 +36,10 @@ def random_blocks(fmt: str, n: int, k: int, rng) -> np.ndarray:
 def main():
     args = sys.argv[1:]
     kdir = args.pop(0)
+    geo = q4k.UNIFIED
+    if args[0] == "--geometry":
+        geo = {g.name: g for g in q4k.GEOMETRIES}[args[1]]
+        args = args[2:]
     rng = np.random.default_rng(0)
     jobs = []  # (label, format, N, K, raw)
     if args[0] == "--gguf":
@@ -54,15 +59,15 @@ def main():
 
     npu = Npu()
     path = lambda tag, ext: os.path.join(kdir, tag + ext)  # noqa: E731
-    built = sorted(f[:-7] for f in os.listdir(kdir) if f.startswith(("q4_", "q6_")) and f.endswith(".xclbin"))
-    k = npu.load("qgemv", path(built[0], ".xclbin"), path(built[0], ".bin"))  # one context for every shape
+    first = geo.program(int(jobs[0][1][1]), jobs[0][2], jobs[0][3])
+    k = npu.load("qgemv", path(first, ".xclbin"), path(first, ".bin"))  # one context for every shape
     for label, fmt, N, K, raw in jobs:
-        mod, tag = FORMATS[fmt], f"{fmt}_{N}x{K}"
+        mod, tag = FORMATS[fmt], geo.program(int(fmt[1]), N, K)
         if tag not in k.programs:
             k.add_program(tag, path(tag, ".bin"))
         x = to_bf16(rng.standard_normal(K).astype(np.float32))
-        tiles = mod.repack(raw)
-        xin = q4k.x_input(x, int(fmt[1]), N, K)
+        tiles = mod.repack(raw, geo)
+        xin = q4k.x_input(x, int(fmt[1]), N, K, geo)
         bo_w, bo_x, bo_y = npu.bo(tiles.nbytes, k.group(0)), npu.bo(xin.nbytes, k.group(1)), npu.bo(N * 4, k.group(2))
         bo_w.write(tiles.tobytes(), 0)
         bo_w.sync(TO_DEV)

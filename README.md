@@ -45,7 +45,7 @@ That is **1.6× faster and 2.5× less energy than the CPU, with the CPU nearly f
 | NPU kernels compiled with mlir-aie, running on the **Windows** NPU driver | ✅ |
 | Prefill with every linear layer on the NPU (bf16) | ✅ |
 | Native tokenizer, chat template, generation loop | ⏳ next |
-| Decode on the NPU (KV cache): **Q4_K_M** ~14 tok/s, or **Q6_K** ~11 tok/s at near-BF16 accuracy | ✅ |
+| Decode on the NPU (KV cache): **Q4_K_M** ~14–15 tok/s, or **Q6_K** ~12–13 tok/s at near-BF16 accuracy | ✅ |
 | Accuracy harness: perplexity and KL divergence vs BF16; NPU engine adds ~0 on top of the GGUF | ✅ |
 | OpenAI-compatible server (streaming, tool calls) | ⏳ |
 | Windows app (chat, thinking toggle, web search) and installer | ⏳ |

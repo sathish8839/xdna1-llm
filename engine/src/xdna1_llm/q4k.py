@@ -8,6 +8,8 @@ unpacks the 6-bit fields: nothing is rounded.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 from .bf16 import from_bf16, to_bf16
@@ -44,30 +46,63 @@ def dequantize(raw: np.ndarray) -> np.ndarray:
     return np.repeat(s, G, axis=1) * q - np.repeat(m, G, axis=1)
 
 
-# Shared by both formats; must match kernels/designs/qgemv.cc. Tiles are the same size for Q4_K and Q6_K so one
-# NPU program runs both; a row of K columns takes ceil(K / KC) tiles and the last one may be partly used.
-TILE_BYTES, LANES = 10944, 8
-KC = {4: 1024, 6: 768}  # columns per tile: Q4_K 10752 bytes used, Q6_K 10944
+# Tile geometry, shared by both formats; must match the kernel build (kernels/designs/qgemv.py --geometry).
+# A row of K columns takes ceil(K / KC) tiles and the last one may be partly used (its padding is streamed too).
+LANES, K_MAX = 8, 7680
 
 
-def layout(K: int, fmt: int = 4) -> tuple[int, int]:
+@dataclass(frozen=True)
+class Geometry:
+    name: str
+    tile: int  # bytes per tile
+    kc4: int  # columns per tile, Q4_K
+    kc6: int  # columns per tile, Q6_K
+
+    def kc(self, fmt: int) -> int:
+        return self.kc4 if fmt == 4 else self.kc6
+
+    @property
+    def x_tiles(self) -> int:  # x (K_MAX bf16) and the header travel in this many tiles
+        return -(-2 * K_MAX // self.tile)
+
+    def program(self, fmt: int, N: int, K: int) -> str:
+        """Name of the kernel build (xclbin / instruction stream) for one matrix shape."""
+        if self.name == "unified":
+            return f"q{fmt}_{N}x{K}"
+        if fmt != 6:
+            raise ValueError(f"the {self.name} geometry only runs Q6_K")
+        return f"{self.name}_{N}x{K}"
+
+
+# unified: one program for Q4_K (1024 columns, 10752 bytes used) and Q6_K (768 columns, 10944 bytes), so a
+# Q4_K_M model runs in one context; K = 2048 Q6_K rows stream 12.5 % padding.
+UNIFIED = Geometry("unified", 10944, 1024, 768)
+# q6only: Q6_K in 512-column tiles (7296 bytes), which divide K = 2048 and 7680 exactly: for all-Q6_K models.
+Q6ONLY = Geometry("q6only", 7296, 512, 512)
+GEOMETRIES = (UNIFIED, Q6ONLY)
+TILE_BYTES, KC = UNIFIED.tile, {4: UNIFIED.kc4, 6: UNIFIED.kc6}
+
+
+def layout(K: int, fmt: int = 4, geo: Geometry = UNIFIED) -> tuple[int, int]:
     """(columns per tile, tiles per 16-row block)."""
-    return KC[fmt], -(-K // KC[fmt])
+    return geo.kc(fmt), -(-K // geo.kc(fmt))
 
 
-def x_input(xbits: np.ndarray, fmt: int, N: int, K: int) -> np.ndarray:
-    """The kernel's x input (two tiles): x as bf16 bits, then [blocks per lane, tiles per block, format, K] as
-    int32 in the last 16 bytes."""
-    buf = np.zeros(2 * TILE_BYTES, np.uint8)
+def x_input(xbits: np.ndarray, fmt: int, N: int, K: int, geo: Geometry = UNIFIED) -> np.ndarray:
+    """The kernel's x input (geo.x_tiles tiles): x as bf16 bits, then [blocks per lane, tiles per block, format,
+    K] as int32 in the last 16 bytes."""
+    buf = np.zeros(geo.x_tiles * geo.tile, np.uint8)
     buf[: 2 * K] = np.asarray(xbits, np.uint16).view(np.uint8)
-    buf[-16:] = np.array([N // LANES // RB, layout(K, fmt)[1], fmt, K], np.int32).view(np.uint8)
+    buf[-16:] = np.array([N // LANES // RB, layout(K, fmt, geo)[1], fmt, K], np.int32).view(np.uint8)
     return buf
 
 
-def pad_tiles(parts: list[np.ndarray]) -> np.ndarray:
-    """Per-tile byte sections, each (blocks, tiles, n) -> (blocks * tiles * TILE_BYTES,) with zero padding."""
+def pad_tiles(parts: list[np.ndarray], geo: Geometry = UNIFIED) -> np.ndarray:
+    """Per-tile byte sections, each (blocks, tiles, n) -> (blocks * tiles * geo.tile,) with zero padding."""
     body = np.concatenate(parts, axis=2)
-    out = np.zeros((*body.shape[:2], TILE_BYTES), np.uint8)
+    if body.shape[2] > geo.tile:
+        raise ValueError(f"{body.shape[2]} bytes per tile, the {geo.name} geometry holds {geo.tile}")
+    out = np.zeros((*body.shape[:2], geo.tile), np.uint8)
     out[..., : body.shape[2]] = body
     return out.reshape(-1)
 
@@ -77,13 +112,13 @@ def _hi_lo(v: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return hi, to_bf16(v - from_bf16(hi))
 
 
-def repack(raw: np.ndarray) -> np.ndarray:
+def repack(raw: np.ndarray, geo: Geometry = UNIFIED) -> np.ndarray:
     """Q4_K rows, uint8 (N, K/256*144) -> kernel tiles, ordered (16-row block, k chunk). Each tile:
     nibbles (k pair-major, 16 rows), then per group sc and mn for 16 rows, then per super-block d_hi, d_lo,
     dmin_hi, dmin_lo for 16 rows (all bf16), then zero padding. Columns past K are zero."""
     q, sc, mn, d, dmin = unpack(raw)
     N, K = q.shape
-    kc, nc = layout(K, 4)
+    kc, nc = layout(K, 4, geo)
     pad = nc * kc - K
     q = np.pad(q, ((0, 0), (0, pad)))
     sc, mn = (np.pad(a, ((0, 0), (0, pad // G))) for a in (sc, mn))
@@ -94,7 +129,7 @@ def repack(raw: np.ndarray) -> np.ndarray:
     nib = (qb[..., 0] | (qb[..., 1] << 4)).astype(np.uint8).transpose(0, 2, 3, 1)  # (block, chunk, k pair, row)
     scm = rows_last([to_bf16(sc.astype(np.float32)), to_bf16(mn.astype(np.float32))], nb, nc, ngc)
     dd = rows_last([*_hi_lo(d), *_hi_lo(dmin)], nb, nc, nsc)
-    return pad_tiles([nib.reshape(nb, nc, -1), scm, dd])
+    return pad_tiles([nib.reshape(nb, nc, -1), scm, dd], geo)
 
 
 def rows_last(parts, nb, nc, n):

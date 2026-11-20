@@ -6,36 +6,45 @@
 //   Q6_K: W[r, k] = d[r, b] * sc[r, g] * (q[r, k] - 32)                   q in 0..63, g = k / 16
 // Both are the formats' own math, so results match llama.cpp's dequantization to fp32 rounding.
 //
-// Every weight tile is TILE_BYTES and covers 16 rows (vector lanes = rows) and KC4 (Q4_K) or KC6 (Q6_K) columns;
-// the two sizes are chosen so the tiles are (nearly) the same size. A row of K columns takes ceil(K / KC) tiles;
-// the last one may be partly used. Inside a tile (xdna1_llm/q4k.py and q6k.py write this):
+// Every weight tile is TILE_BYTES and covers 16 rows (vector lanes = rows) and KC4 (Q4_K) or KC6 (Q6_K) columns.
+// The geometry is a build option (xdna1_llm.q4k.Geometry): the unified build sizes both formats to (nearly) the
+// same tile so a Q4_K_M model runs in one program; the q6only build uses 512-column Q6_K tiles, which divide
+// LFM3's K = 2048 and 7680, so no padding is streamed. A row of K columns takes ceil(K / KC) tiles; the last one
+// may be partly used. Inside a tile (xdna1_llm/q4k.py and q6k.py write this):
 //   Q4_K: nibbles   KC4/2 x 16 B: chunk p holds q[i, 2p] | q[i, 2p+1] << 4 for rows i = 0..15
 //         groups    per 32 k: sc[16], mn[16] (bf16, small integers, exact)
 //         blocks    per 256 k: d_hi[16], d_lo[16], dmin_hi[16], dmin_lo[16] (bf16, hi + lo == the fp16 exactly)
 //   Q6_K: nibbles   KC6/2 x 16 B: the low 4 bits, as above
-//         high bits KC6/8 x 32 B: byte i (row i % 16, side s = i / 16) holds the high 2 bits of k = 2s, 2s+1,
-//                   2s+4, 2s+5 (relative to the 8 k) in bits 0-1, 2-3, 4-5, 6-7: the lane order of the nibble
-//                   vectors below, so no shuffles are needed
+//         high bits KC6/16 x 64 B: byte i (row i % 16, j = i / 16) holds the high 2 bits of k = 2j, 2j+1,
+//                   8+2j, 9+2j (relative to the group's 16 k) in bits 0-1, 2-3, 4-5, 6-7: the lane order of the
+//                   two 64-byte nibble vectors of the group, so merging needs no shuffles
 //         groups    per 16 k: sc[16] (bf16)
 //         blocks    per 256 k: d_hi[16], d_lo[16]
-// x arrives first, over two tiles: x as bf16 from byte 0, and a header in the last 16 bytes of the second tile:
+// x arrives first, over X_TILES tiles: x as bf16 from byte 0, and a header in the last 16 bytes of the last tile:
 // [16-row blocks for this lane, tiles per block, format (4 or 6), K].
 //
 // Quantized values become bf16 exactly with the exponent trick (0x4300 | q) == 128 + q; the offset (128, plus 32
 // for Q6_K) times sum(x) is removed per group. AIE2 has no fast fp32 multiply, so every scaling step is a native
 // bf16 MAC on fp32 values split into bf16 high and low parts.
 //
+// Speed (the loops are bound by instruction latency, not MACs): bit masks run on full 64-byte vectors; bytes
+// become bf16 with one shuffle (zip with 0x43); x is read as scalars from memory and broadcast; each group's MACs
+// go to 4 independent accumulators; and the group loop is unrolled twice so two groups' chains overlap.
+//
 // IRON compiles one object per ExternalFunction, so each function is built on its own (QG_FN) and they share
 // state through globals.
 #include <aie_api/aie.hpp>
 #include <stdint.h>
 
+#ifndef TILE_BYTES  // unified geometry: Q4_K 4 super-blocks per tile (10752 bytes used), Q6_K 3 (10944)
 #define TILE_BYTES 10944
+#define KC4 1024
+#define KC6 768
+#endif
 #define K_MAX 7680
+#define X_TILES ((2 * K_MAX + TILE_BYTES - 1) / TILE_BYTES)
 #define RB 16
 #define QK 256
-#define KC4 1024  // Q4_K: 4 super-blocks per tile, 10752 bytes used
-#define KC6 768   // Q6_K: 3 super-blocks per tile, 10944 bytes used
 
 extern "C" {
 
@@ -51,7 +60,7 @@ void qg_load_x(const uint8_t *__restrict src, bfloat16 *__restrict x, int32_t *_
   const int begin = xpart * (TILE_BYTES / 2), end = begin + TILE_BYTES / 2 < K_MAX ? begin + TILE_BYTES / 2 : K_MAX;
   for (int i = begin; i < end; i += 32)
     aie::store_v(x + i, aie::load_v<32>(s + (i - begin)));
-  if (++xpart < 2)
+  if (++xpart < X_TILES)
     return;
   xpart = 0;
   const int32_t *h = (const int32_t *)(src + TILE_BYTES - 16);
@@ -95,43 +104,53 @@ static inline void split(aie::vector<float, 16> v, vbf16_t &hi, vbf16_t &lo) {
   lo = accf16_t(aie::sub(v, h.to_vector<float>())).to_vector<bfloat16>();
 }
 
-// 32 quantized values (bytes) -> bf16 128 + q
-static inline aie::vector<bfloat16, 32> to_bf16(aie::vector<uint8_t, 32> q) {
-  return aie::vector_cast<bfloat16>(aie::bit_or(aie::unpack(q), aie::broadcast<uint16_t, 32>(0x4300)));
+// 64 quantized values (bytes) -> two vectors of 32 bf16 128 + q: zipping in 0x43 as each high byte is one
+// shuffle per output vector (unpack + or would be two ALU operations, on half-width vectors)
+static inline void to_bf16_zip(aie::vector<uint8_t, 64> q, aie::vector<bfloat16, 32> &a, aie::vector<bfloat16, 32> &b) {
+  const auto [lo, hi] = aie::interleave_zip(q, aie::broadcast<uint8_t, 64>(0x43), 1);
+  a = aie::vector_cast<bfloat16>(lo);
+  b = aie::vector_cast<bfloat16>(hi);
 }
 
-// lo: lanes 0-15 rows at k = kk, lanes 16-31 at kk + 2; hi: kk + 1 and kk + 3. mac_elem_16_2 adds lanes i and
-// i + 16 into accumulator lane i, so one instruction does 32 multiply-adds.
-extern "C++" {  // templates need C++ linkage
-template <unsigned N>
-static inline v16accfloat quad(v16accfloat a, aie::vector<uint8_t, 32> lo, aie::vector<uint8_t, 32> hi,
-                               const aie::vector<bfloat16, N> &xv, int kk) {
-  aie::vector<bfloat16, 32> x02 = aie::concat(aie::broadcast<bfloat16, 16>(xv[kk]), aie::broadcast<bfloat16, 16>(xv[kk + 2]));
-  aie::vector<bfloat16, 32> x13 = aie::concat(aie::broadcast<bfloat16, 16>(xv[kk + 1]), aie::broadcast<bfloat16, 16>(xv[kk + 3]));
-  a = mac_elem_16_2(to_bf16(lo).to_native(), x02.to_native(), a);
-  return mac_elem_16_2(to_bf16(hi).to_native(), x13.to_native(), a);
+// lo: lanes 0-15 rows at k = xp[0], lanes 16-31 at xp[2]; hi: xp[1] and xp[3]. mac_elem_16_2 adds lanes i and
+// i + 16 into accumulator lane i, so one instruction does 32 multiply-adds. x is read as scalars from memory
+// (load slots) rather than extracted from a vector register.
+static inline v16accfloat quad(v16accfloat a, aie::vector<bfloat16, 32> lo, aie::vector<bfloat16, 32> hi,
+                               const bfloat16 *__restrict xp) {
+  aie::vector<bfloat16, 32> x02 = aie::concat(aie::broadcast<bfloat16, 16>(xp[0]), aie::broadcast<bfloat16, 16>(xp[2]));
+  aie::vector<bfloat16, 32> x13 = aie::concat(aie::broadcast<bfloat16, 16>(xp[1]), aie::broadcast<bfloat16, 16>(xp[3]));
+  a = mac_elem_16_2(lo.to_native(), x02.to_native(), a);
+  return mac_elem_16_2(hi.to_native(), x13.to_native(), a);
 }
-}  // extern "C++"
+
+// sum of independent accumulators (one MAC chain each, so their latencies overlap)
+static inline aie::vector<float, 16> sum4(v16accfloat a0, v16accfloat a1, v16accfloat a2, v16accfloat a3) {
+  return aie::add(aie::add(accf16_t(a0), accf16_t(a1)), aie::add(accf16_t(a2), accf16_t(a3))).to_vector<float>();
+}
 
 static inline accf16_t q4_tile(const uint8_t *__restrict w, const bfloat16 *__restrict x, accf16_t acc_y, int nsb) {
   const bfloat16 *__restrict scm = (const bfloat16 *)(w + KC4 / 2 * RB);
   const bfloat16 *__restrict dd = scm + KC4 / 32 * 2 * RB;
-  const aie::vector<uint8_t, 32> m0f = aie::broadcast<uint8_t, 32>(0x0F);
+  const aie::vector<uint8_t, 64> m0f = aie::broadcast<uint8_t, 64>(0x0F);
   const int g0 = qg_chunk * (KC4 / 32);
   for (int b = 0; b < nsb; b++) {
     accf16_t acc_s = aie::zeros<accfloat, 16>(), acc_m = acc_s;  // sum of sc * dot, mn * xsum
+    _Pragma("clang loop unroll_count(2)")
     for (int gb = 0; gb < 8; gb++) {
       const int gc = b * 8 + gb, g = g0 + gc;
       const uint8_t *__restrict wg = w + gc * 16 * RB;
-      const aie::vector<bfloat16, 32> xg = aie::load_v<32>(x + g * 32);
-      v16accfloat a = aie::zeros<accfloat, 16>().to_native();
+      const bfloat16 *__restrict xg = x + g * 32;
+      v16accfloat a[4];
       _Pragma("clang loop unroll(full)")
-      for (int kk = 0; kk < 32; kk += 4) {
-        aie::vector<uint8_t, 32> v = aie::load_v<32>(wg + kk / 2 * RB);
-        a = quad(a, aie::bit_and(v, m0f), aie::downshift(v, 4), xg, kk);
+      for (int i = 0; i < 4; i++) {  // 64 bytes = k pairs j = 0..3 (then row): even k low, odd k high
+        const aie::vector<uint8_t, 64> v = aie::load_v<64>(wg + i * 4 * RB);
+        aie::vector<bfloat16, 32> ea, eb, oa, ob;
+        to_bf16_zip(aie::bit_and(v, m0f), ea, eb);
+        to_bf16_zip(aie::downshift(v, 4), oa, ob);
+        a[i] = quad(quad(aie::zeros<accfloat, 16>().to_native(), ea, oa, xg + i * 8), eb, ob, xg + i * 8 + 4);
       }
       vbf16_t dot_hi, dot_lo;
-      split(aie::sub(accf16_t(a).to_vector<float>(), qg_xoff[g]), dot_hi, dot_lo);
+      split(aie::sub(sum4(a[0], a[1], a[2], a[3]), qg_xoff[g]), dot_hi, dot_lo);
       vbf16_t sc = aie::load_v<16>(scm + gc * 2 * RB), mn = aie::load_v<16>(scm + gc * 2 * RB + RB);
       acc_s = aie::mac(aie::mac(acc_s, sc, dot_hi), sc, dot_lo);
       acc_m = aie::mac(aie::mac(acc_m, mn, qg_xs_hi[g]), mn, qg_xs_lo[g]);
@@ -153,26 +172,28 @@ static inline accf16_t q6_tile(const uint8_t *__restrict w, const bfloat16 *__re
   const uint8_t *__restrict hbits = w + KC6 / 2 * RB;
   const bfloat16 *__restrict scv = (const bfloat16 *)(hbits + KC6 / 8 * 32);
   const bfloat16 *__restrict dd = scv + KC6 / 16 * RB;
-  const aie::vector<uint8_t, 32> m0f = aie::broadcast<uint8_t, 32>(0x0F), m30 = aie::broadcast<uint8_t, 32>(0x30);
+  const aie::vector<uint8_t, 64> m0f = aie::broadcast<uint8_t, 64>(0x0F), m30 = aie::broadcast<uint8_t, 64>(0x30);
   const int g0 = qg_chunk * (KC6 / 16);
   for (int b = 0; b < nsb; b++) {
     accf16_t acc_s = aie::zeros<accfloat, 16>();  // sum of sc * dot
+    _Pragma("clang loop unroll_count(2)")
     for (int gb = 0; gb < 16; gb++) {
       const int gc = b * 16 + gb, g = g0 + gc;
-      const aie::vector<bfloat16, 16> xg = aie::load_v<16>(x + g * 16);
-      v16accfloat a = aie::zeros<accfloat, 16>().to_native();
-      _Pragma("clang loop unroll(full)")
-      for (int k8 = 0; k8 < 16; k8 += 8) {
-        const int kc = gc * 16 + k8;  // k within the tile
-        aie::vector<uint8_t, 32> hv = aie::load_v<32>(hbits + kc / 8 * 32);
-        aie::vector<uint8_t, 32> v0 = aie::load_v<32>(w + kc / 2 * RB), v1 = aie::load_v<32>(w + (kc + 4) / 2 * RB);
-        a = quad(a, aie::bit_or(aie::bit_and(v0, m0f), aie::bit_and(aie::upshift(hv, 4), m30)),
-                 aie::bit_or(aie::downshift(v0, 4), aie::bit_and(aie::upshift(hv, 2), m30)), xg, k8);
-        a = quad(a, aie::bit_or(aie::bit_and(v1, m0f), aie::bit_and(hv, m30)),
-                 aie::bit_or(aie::downshift(v1, 4), aie::bit_and(aie::downshift(hv, 2), m30)), xg, k8 + 4);
-      }
+      const bfloat16 *__restrict xg = x + g * 16;
+      // 16 k x 16 rows: n0 holds k 0-7 (lanes: k pair j = 0..3, then row), n1 k 8-15, h their high bits
+      const uint8_t *__restrict wg = w + gc * 8 * RB;
+      const aie::vector<uint8_t, 64> n0 = aie::load_v<64>(wg), n1 = aie::load_v<64>(wg + 64);
+      const aie::vector<uint8_t, 64> h = aie::load_v<64>(hbits + gc * 64);
+      aie::vector<bfloat16, 32> e0a, e0b, o0a, o0b, e1a, e1b, o1a, o1b;  // even / odd k, lanes 0-31 / 32-63
+      to_bf16_zip(aie::bit_or(aie::bit_and(n0, m0f), aie::bit_and(aie::upshift(h, 4), m30)), e0a, e0b);
+      to_bf16_zip(aie::bit_or(aie::downshift(n0, 4), aie::bit_and(aie::upshift(h, 2), m30)), o0a, o0b);
+      to_bf16_zip(aie::bit_or(aie::bit_and(n1, m0f), aie::bit_and(h, m30)), e1a, e1b);
+      to_bf16_zip(aie::bit_or(aie::downshift(n1, 4), aie::bit_and(aie::downshift(h, 2), m30)), o1a, o1b);
+      const v16accfloat z = aie::zeros<accfloat, 16>().to_native();
+      const v16accfloat a0 = quad(z, e0a, o0a, xg), a1 = quad(z, e0b, o0b, xg + 4);
+      const v16accfloat a2 = quad(z, e1a, o1a, xg + 8), a3 = quad(z, e1b, o1b, xg + 12);
       vbf16_t dot_hi, dot_lo;
-      split(aie::sub(accf16_t(a).to_vector<float>(), qg_xoff[g]), dot_hi, dot_lo);
+      split(aie::sub(sum4(a0, a1, a2, a3), qg_xoff[g]), dot_hi, dot_lo);
       vbf16_t sc = aie::load_v<16>(scv + gc * RB);
       acc_s = aie::mac(aie::mac(acc_s, sc, dot_hi), sc, dot_lo);
     }
