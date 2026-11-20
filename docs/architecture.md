@@ -1,6 +1,6 @@
 # Architecture
 
-This describes what exists today. Planned parts (the server, the app) are in the
+This describes what exists today. Planned parts (the installer, fused kernels) are in the
 [roadmap](roadmap.md).
 
 ```
@@ -18,6 +18,12 @@ engine/src/xdna1_llm/
   engine.py          one chat turn: template, prompt, sampling; splits reasoning, content and tool calls
   server.py          OpenAI-compatible HTTP server (standard library), one turn at a time on the NPU
   cli.py             run a prompt or chat message on the NPU and/or CPU, optionally against llama.cpp
+app/                 WinUI 3 chat app (C#, unpackaged, Windows App SDK copied next to the exe)
+  EngineHost.cs      starts `python -m xdna1_llm.server` on a free localhost port, in a kill-on-close job object
+  ChatClient.cs      streams /v1/chat/completions
+  WebSearch.cs       the web_search tool: DuckDuckGo's HTML results, run by the app, never by the engine
+  MarkdownView.cs    markdown (Markdig) to native WinUI text, code blocks and tables
+  MainWindow.xaml    status bar, chat, composer with the thinking and web search toggles
 kernels/build_kernels.sh   builds the xclbins from mlir-aie's whole_array GEMM example
 ```
 

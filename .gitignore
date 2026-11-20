@@ -24,3 +24,7 @@ insts*.bin
 power_*.csv
 *_results*.json
 bench_*.json
+
+# .NET build outputs
+bin/
+obj/

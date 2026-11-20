@@ -151,6 +151,8 @@ def post(url, body):
 
 def test_http_models_and_completion(server):
     url, eng = server
+    with urllib.request.urlopen(url + "/health") as r:
+        assert json.loads(r.read()) == {"status": "ok", "model": "tiny", "device": "CPU", "ctx": 512}
     with urllib.request.urlopen(url + "/v1/models") as r:
         assert json.loads(r.read())["data"][0]["id"] == "tiny"
     msgs = [

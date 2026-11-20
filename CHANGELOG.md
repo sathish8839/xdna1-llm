@@ -7,6 +7,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Windows chat app (`app/`, WinUI 3, .NET 8): streams replies as native markdown, a thinking toggle (reasoning in
+  a collapsed section), a web search toggle (the model calls `web_search`; the app queries DuckDuckGo and returns
+  the results), Stop, NPU status and tokens per second. It starts the engine on a free localhost port and stops it
+  with the window. `/health` now reports the model, device and context length.
 - OpenAI-compatible server (`xdna1-llm-server`, standard library only): `/v1/chat/completions` with SSE streaming,
   tool calls in the OpenAI shape, `reasoning_content`, stop strings and sampling options; `/v1/models` and
   `/health`. Binds to localhost and runs one turn at a time. Checked with the OpenAI Python SDK (Q4_K_M: first

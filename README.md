@@ -23,7 +23,7 @@ and aims for the Q4_K_M quant running entirely on the NPU, behind:
 
 > [!IMPORTANT]
 > **Pre-alpha.** Prefill and token generation (Q4_K_M or Q6_K) run on the NPU and match a CPU reference, with
-> the model's own tokenizer and chat template. An OpenAI-compatible server works; the app is still being built. See the [roadmap](docs/roadmap.md).
+> the model's own tokenizer and chat template. An OpenAI-compatible server and a first Windows chat app work; the installer is still to come. See the [roadmap](docs/roadmap.md).
 
 ## Results so far
 
@@ -49,7 +49,8 @@ That is **1.6× faster and 2.5× less energy than the CPU, with the CPU nearly f
 | Batched prompt on the NPU: ~135 tok/s (689 tokens in 5 s) | ✅ |
 | Accuracy harness: perplexity and KL divergence vs BF16; NPU engine adds ~0 on top of the GGUF | ✅ |
 | OpenAI-compatible server (streaming, thinking, tool calls), ~14 tok/s through the OpenAI SDK | ✅ |
-| Windows app (chat, thinking toggle, web search) and installer | ⏳ |
+| Windows app: streaming markdown chat, thinking toggle, DuckDuckGo web search, NPU status and speed | ✅ |
+| Installer with prebuilt kernels | ⏳ |
 | Norms, conv, attention and SwiGLU fused on the NPU | ⏳ |
 
 ## Supported hardware

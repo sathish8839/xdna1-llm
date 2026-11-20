@@ -50,8 +50,10 @@ def gemm_backend(npu, kdir):
 
 
 class Engine:
-    def __init__(self, model, tok: Tokenizer, name: str, ctx: int = 4096, w=None, thinking: bool = False):
-        self.model, self.tok, self.name, self.ctx, self.w = model, tok, name, ctx, w
+    def __init__(
+        self, model, tok: Tokenizer, name: str, ctx: int = 4096, w=None, thinking: bool = False, device: str = "CPU"
+    ):
+        self.model, self.tok, self.name, self.ctx, self.w, self.device = model, tok, name, ctx, w, device
         self.thinking = thinking  # default when a request does not say
         ids = tok.ids
         self.think_start, self.think_end = ids.get("<think>"), ids.get("</think>")
@@ -66,6 +68,7 @@ class Engine:
 
             lin = NpuQLinear(kernel_dir=kernels, formats=w.types())
             model = LFM3(w, lin, gemm_backend(lin.npu, lin.kdir) if gemm_prompt else None)
+            kw.setdefault("device", lin.npu.name)
         else:
             model = LFM3(w, CpuLinear())
         return cls(model, tok, os.path.splitext(os.path.basename(gguf))[0], w=w, **kw)

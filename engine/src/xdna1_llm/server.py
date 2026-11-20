@@ -3,7 +3,7 @@
     xdna1-llm-server --gguf LFM3-1.7B-Q4_K_M.gguf [--port 8080] [--thinking]
 
 Endpoints:
-  GET  /health                 {"status": "ok"} once the model is loaded
+  GET  /health                 {"status": "ok", "model", "device", "ctx"} once the model is loaded
   GET  /v1/models              the one loaded model
   POST /v1/chat/completions    messages, tools, stream (SSE), max_tokens / max_completion_tokens, temperature,
                                top_p, seed, stop; extensions: top_k, min_p, repeat_penalty, and thinking on or off
@@ -118,7 +118,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/")
         if path == "/health":
-            self._json(200, {"status": "ok"})
+            e = self.engine
+            self._json(200, {"status": "ok", "model": e.name, "device": e.device, "ctx": e.ctx})
         elif path in ("/v1/models", "/models"):
             self._json(200, {"object": "list", "data": [self._model()]})
         elif path in (f"/v1/models/{self.engine.name}", f"/models/{self.engine.name}"):

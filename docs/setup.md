@@ -83,6 +83,22 @@ python benchmarks\power_bench.py --gguf <gguf> --llama-server <llama-server.exe>
 
 `bench_shapes.py` needs the `shapes` kernel set.
 
+### The chat app
+
+Needs the .NET 8 SDK (no Visual Studio).
+
+```powershell
+cd app
+dotnet build -c Release
+$env:XDNA1_LLM_GGUF = "<path>\LFM3-1.7B-Q4_K_M.gguf"   # or pick the file with Model… in the app
+.\bin\Release\net8.0-windows10.0.19041.0\win-x64\xdna1-chat.exe
+```
+
+The app finds the engine's Python in `engine\.venv` above it (or `$env:XDNA1_LLM_PYTHON`), starts the server on a
+free localhost port and stops it when the window closes. Its settings live in `%LOCALAPPDATA%\xdna1-llm\app.json`
+and the engine's output in `engine.log` next to it. Web search sends the model's queries to DuckDuckGo; nothing
+else leaves the machine.
+
 ### The OpenAI-compatible server
 
 ```powershell

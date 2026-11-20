@@ -98,7 +98,7 @@ GGUF Q4_K_M mixes **Q4_K** (most tensors) and **Q6_K** (for LFM3-1.7B: `token_em
 * **Server (done, `xdna1-llm-server`):** OpenAI `/v1/chat/completions` with SSE streaming and `tools`, `/v1/models`, and a health
   endpoint. It binds to localhost by default. It is usable from Open WebUI, Unsloth Studio's external
   provider, IDE plugins and the OpenAI SDKs.
-* **App (WinUI 3, `app/`):** a chat window with streaming markdown, a **thinking** toggle (off by default) and a
+* **App (WinUI 3, `app/`, first version done):** a chat window with streaming markdown, a **thinking** toggle (off by default) and a
   **web search** toggle. With search on, the app offers a `web_search` tool to the model, runs DuckDuckGo
   queries itself and returns the results as tool messages. The app starts and stops the engine and shows
   NPU status and speed.
