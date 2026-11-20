@@ -125,6 +125,7 @@ binds to localhost; pass `--host 0.0.0.0` only on a network you trust (there is 
 
 ```python
 from openai import OpenAI
+
 client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="none")
 r = client.chat.completions.create(model="LFM3-1.7B-Q4_K_M", messages=[{"role": "user", "content": "Hi"}])
 ```
