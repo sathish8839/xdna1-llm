@@ -99,6 +99,17 @@ free localhost port and stops it when the window closes. Its settings live in `%
 and the engine's output in `engine.log` next to it. Web search sends the model's queries to DuckDuckGo; nothing
 else leaves the machine.
 
+### Portable build
+
+```powershell
+.\installer\build-portable.ps1   # -> dist\xdna1-llm
+```
+
+This assembles a folder that runs on any XDNA1 PC with the stock NPU driver, with no Python, .NET or WSL. It
+contains the app (published self-contained), the embeddable CPython 3.13 with the engine, its dependencies and
+`pyxrt.pyd` in `python\`, and the kernels in `kernels\`. It needs the .NET 8 SDK, uv, built kernels and pyxrt in
+`engine\.venv` (or pass `-Kernels` and `-Pyxrt`). The app uses `python\` and `kernels\` when they sit beside it.
+
 ### The OpenAI-compatible server
 
 ```powershell

@@ -61,6 +61,9 @@ public sealed class EngineHost : IDisposable
             psi.ArgumentList.Add(a);
         psi.Environment["PYTHONUNBUFFERED"] = "1";
         psi.Environment["PYTHONIOENCODING"] = "utf-8";
+        var kernels = Path.Combine(AppContext.BaseDirectory, "kernels");  // portable/installer layout
+        if (Directory.Exists(kernels) && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("XDNA1_LLM_KERNELS")))
+            psi.Environment["XDNA1_LLM_KERNELS"] = kernels;
 
         proc = Process.Start(psi) ?? throw new InvalidOperationException($"could not start {python}");
         AssignProcessToJobObject(job, proc.Handle);

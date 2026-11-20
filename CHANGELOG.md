@@ -7,6 +7,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Portable build (`installer/build-portable.ps1`): the app, the embeddable CPython 3.13 with the engine and
+  pyxrt, and the kernels in one folder (241 MB) that needs only the NPU driver. The app now references
+  `Microsoft.WindowsAppSDK.WinUI` instead of the metapackage (no AI/ML runtimes: 204 → 158 MB) and builds its
+  `.pri` on publish, without which the published app crashed at start.
 - Windows chat app (`app/`, WinUI 3, .NET 8): streams replies as native markdown, a thinking toggle (reasoning in
   a collapsed section), a web search toggle (the model calls `web_search`; the app queries DuckDuckGo and returns
   the results), Stop, NPU status and tokens per second. It starts the engine on a free localhost port and stops it

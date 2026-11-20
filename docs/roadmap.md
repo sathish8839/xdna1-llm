@@ -102,7 +102,7 @@ GGUF Q4_K_M mixes **Q4_K** (most tensors) and **Q6_K** (for LFM3-1.7B: `token_em
   **web search** toggle. With search on, the app offers a `web_search` tool to the model, runs DuckDuckGo
   queries itself and returns the results as tool messages. The app starts and stops the engine and shows
   NPU status and speed.
-* **Installer (`installer/`):** an embeddable Python 3.13 with the engine and pyxrt, prebuilt kernels, and the
+* **Installer (`installer/`, portable build done):** an embeddable Python 3.13 with the engine and pyxrt, prebuilt kernels, and the
   app. On first run it downloads the model from Hugging Face. There is no WSL, no Python setup and no driver
   fiddling beyond the stock AMD NPU driver.
 * **CI-built kernels:** a GitHub Actions job builds the xclbins with mlir-aie on Linux and attaches them to
