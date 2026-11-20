@@ -19,21 +19,22 @@ def random_q4k(n: int, k: int, seed: int = 0) -> np.ndarray:
 
 
 def unpack_tiles(tiles: np.ndarray, n: int, k: int) -> np.ndarray:
-    """Read the kernel's tile layout back into float weights (what q4gemv.cc computes, in numpy)."""
-    KC, TB, _ = q4k.layout(k)
-    ngc, nsc = KC // q4k.G, KC // q4k.QK
-    t = tiles.reshape(n // q4k.RB, k // KC, TB)
+    """Read the kernel's tile layout back into float weights (what qgemv.cc computes, in numpy)."""
+    KC, nc = q4k.layout(k, 4)
+    ngc, nsc, kp = KC // q4k.G, KC // q4k.QK, nc * KC
+    t = tiles.reshape(n // q4k.RB, nc, q4k.TILE_BYTES)
     nib = t[..., : KC * 8].reshape(*t.shape[:2], KC // 2, q4k.RB)
-    q = np.stack([nib & 0x0F, nib >> 4], axis=-1).transpose(0, 3, 1, 2, 4).reshape(n, k)  # (row, k)
+    q = np.stack([nib & 0x0F, nib >> 4], axis=-1).transpose(0, 3, 1, 2, 4).reshape(n, kp)  # (row, k)
     rest = t[..., KC * 8 :].copy().view(np.uint16)
     scm = from_bf16(rest[..., : ngc * 2 * q4k.RB]).reshape(*t.shape[:2], ngc, 2, q4k.RB)
-    dd = from_bf16(rest[..., ngc * 2 * q4k.RB :]).reshape(*t.shape[:2], nsc, 4, q4k.RB).astype(np.float64)
+    dd = rest[..., ngc * 2 * q4k.RB : (ngc * 2 + nsc * 4) * q4k.RB]
+    dd = from_bf16(dd).reshape(*t.shape[:2], nsc, 4, q4k.RB).astype(np.float64)
     sc, mn = (scm[..., i, :].transpose(0, 3, 1, 2).reshape(n, -1) for i in (0, 1))
     d = (dd[..., 0, :] + dd[..., 1, :]).transpose(0, 3, 1, 2).reshape(n, -1)
     dmin = (dd[..., 2, :] + dd[..., 3, :]).transpose(0, 3, 1, 2).reshape(n, -1)
     s = np.repeat(d, 8, axis=1) * sc
     m = np.repeat(dmin, 8, axis=1) * mn
-    return (np.repeat(s, q4k.G, axis=1) * q - np.repeat(m, q4k.G, axis=1)).astype(np.float32)
+    return (np.repeat(s, q4k.G, axis=1) * q - np.repeat(m, q4k.G, axis=1)).astype(np.float32)[:, :k]
 
 
 def test_dequantize_matches_gguf():
@@ -46,4 +47,14 @@ def test_dequantize_matches_gguf():
 def test_repack_is_lossless(k):
     n = 32
     raw = random_q4k(n, k, seed=k)
-    np.testing.assert_array_equal(unpack_tiles(q4k.repack(raw), n, k), q4k.dequantize(raw))
+    tiles = q4k.repack(raw)
+    assert tiles.size == n // q4k.RB * q4k.layout(k)[1] * q4k.TILE_BYTES
+    np.testing.assert_array_equal(unpack_tiles(tiles, n, k), q4k.dequantize(raw))
+
+
+def test_x_input_header():
+    x = np.arange(512, dtype=np.uint16)
+    buf = q4k.x_input(x, 6, 2048, 512)
+    assert buf.size == 2 * q4k.TILE_BYTES
+    np.testing.assert_array_equal(buf[:1024].view(np.uint16), x)
+    assert buf[-16:].view(np.int32).tolist() == [2048 // 8 // 16, 1, 6, 512]

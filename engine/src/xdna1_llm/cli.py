@@ -110,11 +110,10 @@ def generate(a, srv, ids):
     dot = lambda t: print(".", end="", flush=True)  # noqa: E731
     out, st, t_prompt, t_gen = m.generate(ids, a.generate, on_token=dot, logits_out=logits)
     n_steps = len(ids) + len(out) - 1
-    switches = f", {lin.switches / n_steps:.0f} context switches" if a.backend == "npu" else ""
     print(f"\n[{a.backend}] {srv.detokenize(out)!r}")
     print(
         f"[{a.backend}] prompt {len(ids) / t_prompt:.1f} tok/s, generation {(len(out) - 1) / t_gen:.1f} tok/s; "
-        f"per token: linears {lin.npu_ms / n_steps:.1f} ms in {lin.calls / n_steps:.0f} calls{switches}, "
+        f"per token: linears {lin.npu_ms / n_steps:.1f} ms in {lin.calls / n_steps:.0f} calls, "
         f"cpu ops {m.cpu_ms / n_steps:.1f} ms"
     )
     if a.compare and a.backend == "npu":  # the exact fp32 CPU reference along the same tokens

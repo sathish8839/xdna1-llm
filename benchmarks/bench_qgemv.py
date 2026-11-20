@@ -4,8 +4,8 @@
     python benchmarks/bench_qgemv.py <kernel_dir> --gguf model.gguf blk.0.ffn_gate.weight blk.0.ffn_down.weight
 
 Shapes (q4_NxK / q6_NxK) use random blocks; --gguf uses real tensors (Q4_K or Q6_K). Results are checked
-against the fp64 product with the GGUF dequantization. One context per (format, K), from the largest N's
-xclbin; each N runs through its own instruction stream.
+against the fp64 product with the GGUF dequantization. One context runs every shape; each runs through its own
+instruction stream.
 """
 
 import os
@@ -18,7 +18,6 @@ from xdna1_llm import q4k, q6k
 from xdna1_llm.bf16 import from_bf16, to_bf16
 from xdna1_llm.npu.device import FROM_DEV, TO_DEV, Npu, hard_exit
 
-LANES, RB = 8, 16
 FORMATS = {"q4": q4k, "q6": q6k}
 
 
@@ -55,24 +54,15 @@ def main():
 
     npu = Npu()
     path = lambda tag, ext: os.path.join(kdir, tag + ext)  # noqa: E731
-    built = [f[:-7] for f in os.listdir(kdir) if f.endswith(".xclbin")]
-    kernels = {}
+    built = sorted(f[:-7] for f in os.listdir(kdir) if f.startswith(("q4_", "q6_")) and f.endswith(".xclbin"))
+    k = npu.load("qgemv", path(built[0], ".xclbin"), path(built[0], ".bin"))  # one context for every shape
     for label, fmt, N, K, raw in jobs:
         mod, tag = FORMATS[fmt], f"{fmt}_{N}x{K}"
-        if (fmt, K) not in kernels:
-            big = max(
-                (b for b in built if b.startswith(fmt) and b.endswith(f"x{K}")), key=lambda b: int(b[3:].split("x")[0])
-            )
-            kernels[fmt, K] = npu.load(f"{fmt}_k{K}", path(big, ".xclbin"), path(big, ".bin"))
-        k = kernels[fmt, K]
         if tag not in k.programs:
             k.add_program(tag, path(tag, ".bin"))
-        _, TB, XT = mod.layout(K)
         x = to_bf16(rng.standard_normal(K).astype(np.float32))
         tiles = mod.repack(raw)
-        xin = np.zeros(XT * TB, np.uint8)
-        xin[: 2 * K] = x.view(np.uint8)
-        xin[-4:] = np.array([N // LANES // RB], np.int32).view(np.uint8)
+        xin = q4k.x_input(x, int(fmt[1]), N, K)
         bo_w, bo_x, bo_y = npu.bo(tiles.nbytes, k.group(0)), npu.bo(xin.nbytes, k.group(1)), npu.bo(N * 4, k.group(2))
         bo_w.write(tiles.tobytes(), 0)
         bo_w.sync(TO_DEV)

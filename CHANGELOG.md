@@ -18,6 +18,8 @@ All notable changes to this project are documented here. The format follows
   streaming-bandwidth probe and benchmarks.
 - One GEMV xclbin per K now serves every N: the tile count travels with the activation, and
   `Kernel.add_program` switches instruction streams inside one context.
+- One NPU program for both quantized formats and every matrix shape: the format and sizes travel in a header
+  with the activation, so decode runs in a single hardware context (8.5 → 11–12 tok/s).
 - Decode loop for Q4_K_M: `LFM3.step` with KV cache and short-conv state, `NpuQLinear` running every linear
   layer and the LM head on the quantized GEMVs, and `xdna1-llm --generate N [--compare]`. 8.5 tok/s, logits
   within cosine 0.99993 of an fp32 reference.

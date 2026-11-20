@@ -1,4 +1,4 @@
-"""GGUF Q4_K weights -> the 4-bit NPU GEMV tile layout (kernels/designs/q4gemv.cc).
+"""GGUF Q4_K weights -> the 4-bit NPU GEMV tile layout (kernels/designs/qgemv.cc).
 
 Q4_K stores each row in super-blocks of 256 weights (144 bytes): an fp16 scale d, an fp16 min dmin, twelve
 bytes of packed 6-bit scales sc and mins mn (one pair per 32 weights) and 128 bytes of 4-bit values q.
@@ -44,11 +44,32 @@ def dequantize(raw: np.ndarray) -> np.ndarray:
     return np.repeat(s, G, axis=1) * q - np.repeat(m, G, axis=1)
 
 
-def layout(K: int) -> tuple[int, int, int]:
-    """(k per tile, tile bytes, tiles that carry x); must match kernels/designs/qgemv.py."""
-    KC = K if K <= 2048 else max(d for d in range(QK, 1537, QK) if K % d == 0)
-    TB = KC // 2 * RB + KC // G * 2 * RB * 2 + KC // QK * 4 * RB * 2
-    return KC, TB, -(-(2 * K + 4) // TB)
+# Shared by both formats; must match kernels/designs/qgemv.cc. Tiles are the same size for Q4_K and Q6_K so one
+# NPU program runs both; a row of K columns takes ceil(K / KC) tiles and the last one may be partly used.
+TILE_BYTES, LANES = 10944, 8
+KC = {4: 1024, 6: 768}  # columns per tile: Q4_K 10752 bytes used, Q6_K 10944
+
+
+def layout(K: int, fmt: int = 4) -> tuple[int, int]:
+    """(columns per tile, tiles per 16-row block)."""
+    return KC[fmt], -(-K // KC[fmt])
+
+
+def x_input(xbits: np.ndarray, fmt: int, N: int, K: int) -> np.ndarray:
+    """The kernel's x input (two tiles): x as bf16 bits, then [blocks per lane, tiles per block, format, K] as
+    int32 in the last 16 bytes."""
+    buf = np.zeros(2 * TILE_BYTES, np.uint8)
+    buf[: 2 * K] = np.asarray(xbits, np.uint16).view(np.uint8)
+    buf[-16:] = np.array([N // LANES // RB, layout(K, fmt)[1], fmt, K], np.int32).view(np.uint8)
+    return buf
+
+
+def pad_tiles(parts: list[np.ndarray]) -> np.ndarray:
+    """Per-tile byte sections, each (blocks, tiles, n) -> (blocks * tiles * TILE_BYTES,) with zero padding."""
+    body = np.concatenate(parts, axis=2)
+    out = np.zeros((*body.shape[:2], TILE_BYTES), np.uint8)
+    out[..., : body.shape[2]] = body
+    return out.reshape(-1)
 
 
 def _hi_lo(v: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -59,19 +80,24 @@ def _hi_lo(v: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 def repack(raw: np.ndarray) -> np.ndarray:
     """Q4_K rows, uint8 (N, K/256*144) -> kernel tiles, ordered (16-row block, k chunk). Each tile:
     nibbles (k pair-major, 16 rows), then per group sc and mn for 16 rows, then per super-block d_hi, d_lo,
-    dmin_hi, dmin_lo for 16 rows (all bf16)."""
+    dmin_hi, dmin_lo for 16 rows (all bf16), then zero padding. Columns past K are zero."""
     q, sc, mn, d, dmin = unpack(raw)
     N, K = q.shape
-    KC = layout(K)[0]
-    nb, nc, ngc, nsc = N // RB, K // KC, KC // G, KC // QK
+    kc, nc = layout(K, 4)
+    pad = nc * kc - K
+    q = np.pad(q, ((0, 0), (0, pad)))
+    sc, mn = (np.pad(a, ((0, 0), (0, pad // G))) for a in (sc, mn))
+    d, dmin = (np.pad(a, ((0, 0), (0, pad // QK))) for a in (d, dmin))
+    nb, ngc, nsc = N // RB, kc // G, kc // QK
 
-    qb = q.reshape(nb, RB, nc, KC // 2, 2)
+    qb = q.reshape(nb, RB, nc, kc // 2, 2)
     nib = (qb[..., 0] | (qb[..., 1] << 4)).astype(np.uint8).transpose(0, 2, 3, 1)  # (block, chunk, k pair, row)
+    scm = rows_last([to_bf16(sc.astype(np.float32)), to_bf16(mn.astype(np.float32))], nb, nc, ngc)
+    dd = rows_last([*_hi_lo(d), *_hi_lo(dmin)], nb, nc, nsc)
+    return pad_tiles([nib.reshape(nb, nc, -1), scm, dd])
 
-    def rows_last(parts, n):  # list of (N, ...) arrays -> (block, chunk, n, len(parts), row) bf16 bytes
-        a = np.stack([p.reshape(nb, RB, nc, n) for p in parts], axis=-1)
-        return np.ascontiguousarray(a.transpose(0, 2, 3, 4, 1)).view(np.uint8).reshape(nb, nc, -1)
 
-    scm = rows_last([to_bf16(sc.astype(np.float32)), to_bf16(mn.astype(np.float32))], ngc)
-    dd = rows_last([*_hi_lo(d), *_hi_lo(dmin)], nsc)
-    return np.concatenate([nib.reshape(nb, nc, -1), scm, dd], axis=2).reshape(-1)
+def rows_last(parts, nb, nc, n):
+    """(N, nc * n) arrays -> bytes (block, chunk, n, len(parts), row): per item, the parts for 16 rows each."""
+    a = np.stack([p.reshape(nb, RB, nc, n) for p in parts], axis=-1)
+    return np.ascontiguousarray(a.transpose(0, 2, 3, 4, 1)).view(np.uint8).reshape(nb, nc, -1)

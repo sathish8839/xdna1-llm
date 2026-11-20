@@ -1,4 +1,4 @@
-"""GGUF Q6_K weights -> the 6-bit NPU GEMV tile layout (kernels/designs/q6gemv.cc).
+"""GGUF Q6_K weights -> the 6-bit NPU GEMV tile layout (kernels/designs/qgemv.cc).
 
 Q6_K stores each row in super-blocks of 256 weights (210 bytes): 128 bytes with the low 4 bits of each value,
 64 bytes with the high 2 bits, sixteen int8 scales sc (one per 16 weights) and an fp16 scale d.
@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from . import q4k
 from .bf16 import to_bf16
-from .q4k import _hi_lo
 
 QK = 256  # weights per Q6_K super-block
 BLOCK_BYTES = 210
@@ -41,11 +41,9 @@ def dequantize(raw: np.ndarray) -> np.ndarray:
     return np.repeat(s, G, axis=1) * (q.astype(np.float32) - 32)
 
 
-def layout(K: int) -> tuple[int, int, int]:
-    """(k per tile, tile bytes, tiles that carry x); must match kernels/designs/qgemv.py."""
-    KC = max(d for d in range(QK, 1281, QK) if K % d == 0)
-    TB = KC // 2 * RB + KC // 8 * 32 + KC // G * RB * 2 + KC // QK * 2 * RB * 2
-    return KC, TB, -(-(2 * K + 4) // TB)
+def layout(K: int) -> tuple[int, int]:
+    """(columns per tile, tiles per 16-row block)."""
+    return q4k.layout(K, 6)
 
 
 def repack(raw: np.ndarray) -> np.ndarray:
@@ -54,11 +52,16 @@ def repack(raw: np.ndarray) -> np.ndarray:
     high bits:   per 8 k, 32 bytes; byte i (row i % 16, side s = i // 16) holds the high 2 bits of
                  k = 2s, 2s+1, 2s+4, 2s+5 in bits 0-1, 2-3, 4-5, 6-7
     scales:      per 16 k, sc for 16 rows (bf16, exact)
-    super-block: d_hi, d_lo for 16 rows (bf16, d_hi + d_lo == d exactly)"""
+    super-block: d_hi, d_lo for 16 rows (bf16, d_hi + d_lo == d exactly)
+    then zero padding to the tile size. Columns past K are zero."""
     q, sc, d = unpack(raw)
     N, K = q.shape
-    KC = layout(K)[0]
-    nb, nc = N // RB, K // KC
+    KC, nc = layout(K)
+    pad = nc * KC - K
+    q = np.pad(q, ((0, 0), (0, pad)))
+    sc = np.pad(sc, ((0, 0), (0, pad // G)))
+    d = np.pad(d, ((0, 0), (0, pad // QK)))
+    nb = N // RB
 
     qb = q.reshape(nb, RB, nc, KC // 2, 2) & 0x0F
     nib = (qb[..., 0] | (qb[..., 1] << 4)).astype(np.uint8).transpose(0, 2, 3, 1)  # (block, chunk, k pair, row)
@@ -67,11 +70,6 @@ def repack(raw: np.ndarray) -> np.ndarray:
     hb = h[..., 0, :, 0] | (h[..., 0, :, 1] << 2) | (h[..., 1, :, 0] << 4) | (h[..., 1, :, 1] << 6)
     hb = hb.astype(np.uint8).transpose(0, 2, 3, 4, 1)  # (block, chunk, 8k, side, row)
 
-    def rows_last(parts, n):  # list of (N, ...) arrays -> (block, chunk, n, len(parts), row) bf16 bytes
-        a = np.stack([p.reshape(nb, RB, nc, n) for p in parts], axis=-1)
-        return np.ascontiguousarray(a.transpose(0, 2, 3, 4, 1)).view(np.uint8).reshape(nb, nc, -1)
-
-    scv = rows_last([to_bf16(sc.astype(np.float32))], KC // G)
-    dd = rows_last([*_hi_lo(d)], KC // QK)
-    parts = [nib.reshape(nb, nc, -1), hb.reshape(nb, nc, -1), scv, dd]
-    return np.concatenate(parts, axis=2).reshape(-1)
+    scv = q4k.rows_last([to_bf16(sc.astype(np.float32))], nb, nc, KC // G)
+    dd = q4k.rows_last([*q4k._hi_lo(d)], nb, nc, KC // QK)
+    return q4k.pad_tiles([nib.reshape(nb, nc, -1), hb.reshape(nb, nc, -1), scv, dd])

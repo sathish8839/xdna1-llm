@@ -50,10 +50,10 @@ These come from measurements in [benchmarks.md](benchmarks.md):
 * **Quantized GEMVs** (`kernels/designs/qgemv.py`): read Q4_K and Q6_K repacked at load (`xdna1_llm/q4k.py`,
   `q6k.py`), every LFM3 Q4_K_M tensor shape including FFN down (K = 7680) and the 128000-row LM head,
   ~1e-4 from the GGUF dequantization. Remaining: fewer dispatches, a faster 6-bit unpack.
-* **Decode loop**: done for Q4_K_M (`LFM3.step` / `generate`, `xdna1-llm --generate`), 8.5 tok/s, logits
+* **Decode loop**: done for Q4_K_M (`LFM3.step` / `generate`, `xdna1-llm --generate`), 11–12 tok/s, logits
   within cosine 0.99993 of an fp32 reference. KV cache and short-conv state live on the CPU for now.
-* Next: one context for all quantized GEMVs (today 59 context switches per token cost more than the kernels),
-  then fewer calls per layer, a batched prompt path, and state in NPU-visible buffers.
+* One context for every quantized GEMV (format and sizes travel with the data): done, 8.5 → 11–12 tok/s.
+* Next: fewer calls per layer, a batched prompt path, and state in NPU-visible buffers.
 
 ## M4: Q4_K_M on the NPU
 
@@ -71,7 +71,7 @@ GGUF Q4_K_M mixes **Q4_K** (most tensors) and **Q6_K** (for LFM3-1.7B: `token_em
 2. **W4A16 kernel:** unpack nibbles in the vector unit, apply the group scale and min, then bf16 `mmul`.
 3. **Optional W4A8:** AIE2's int4 × int8 MAC modes with per-token int8 activations. Faster, slightly different
    numerics; benchmark against (2).
-4. Q6_K: same structure with a 6-bit unpack. Done for decode (`kernels/designs/q6gemv.cc`).
+4. Q6_K: same structure with a 6-bit unpack. Done for decode (`kernels/designs/qgemv.cc`).
 
 ## M5–M6: server, app, installer
 

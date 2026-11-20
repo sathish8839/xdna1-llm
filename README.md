@@ -45,7 +45,7 @@ That is **1.6× faster and 2.5× less energy than the CPU, with the CPU nearly f
 | NPU kernels compiled with mlir-aie, running on the **Windows** NPU driver | ✅ |
 | Prefill with every linear layer on the NPU (bf16) | ✅ |
 | Native tokenizer, chat template, generation loop | ⏳ next |
-| **Q4_K_M** decode on the NPU (Q4_K / Q6_K GEMVs, KV cache): 8.5 tok/s, being optimized | ✅ |
+| **Q4_K_M** decode on the NPU (Q4_K / Q6_K GEMVs, KV cache): 11–12 tok/s, being optimized | ✅ |
 | OpenAI-compatible server (streaming, tool calls) | ⏳ |
 | Windows app (chat, thinking toggle, web search) and installer | ⏳ |
 | Norms, conv, attention and SwiGLU fused on the NPU | ⏳ |

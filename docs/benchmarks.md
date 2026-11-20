@@ -42,10 +42,11 @@ Everything below was measured on a Ryzen 7 250 (XDNA1, "NPU Phoenix"), Windows 1
 ## 3b. Decode GEMV (M = 1)
 
 `kernels/designs/stream_bw.py` streams host memory into cores with no compute. `kernels/designs/gemv.py` (bf16) and
-`kernels/designs/qgemv.py` (GGUF Q4_K and Q6_K) are the decode GEMVs: 8 lanes (two shim channels per column, cores in rows
-2–3), each lane owning N/8 rows, with the activation and the tile count sent on the same lane ahead of the
-weights. Because the cores read the tile count from the data, one xclbin per K serves every N; only the
-instruction stream changes. Medians of 50 runs, including dispatch, all sizes of a K in one hardware context.
+`kernels/designs/qgemv.py` (GGUF Q4_K and Q6_K) are the decode GEMVs: 8 lanes (two shim channels per column,
+cores in rows 2–3), each lane owning N/8 rows, with the activation and a small header sent on the same lane ahead
+of the weights. Because the cores read the sizes from the data, one bf16 xclbin per K serves every N, and one
+quantized xclbin serves every format, K and N; only the instruction stream changes. Medians of 50 runs,
+including dispatch.
 
 | Streaming only (16 MB) | 1 lane | 2 lanes | 4 lanes | 8 lanes |
 |---|---|---|---|---|
@@ -93,8 +94,11 @@ exists in the model:
   group scales and the fp16 scale are stored as in the 4-bit layout (7.1 bits per weight; the GGUF file is 6.56).
   The extra unpacking makes the 6-bit kernel compute-bound at mid sizes (16 GB/s on FFN down) while the LM head
   streams at 23 GB/s.
-* Long rows (K = 7680) are split into 1536-column tiles; the core keeps the partial sums between them. Each
-  16-row block's outputs stream back as soon as they are done, so N is not limited by core memory.
+* Rows are split into fixed-size tiles (10.9 KB: 1024 Q4_K or 768 Q6_K columns), so one core program handles
+  both formats and every K; the last tile of a row may be partly used (Q4_K pads under 2 %, the Q6_K LM head
+  12 %). The core keeps the partial sums between a row's tiles, and each 16-row block's outputs stream back as
+  soon as they are done, so N is not limited by core memory. The tables above are from the earlier per-format
+  builds; the merged kernel is within ~5 % (LM head 10.0 ms).
 * Each call carries ~0.15–0.2 ms of fixed cost, which is why small shapes reach less. Fusing calls per layer
   removes most of it.
 * Estimated LFM3-1.7B 4-bit decode at these rates, one call per projection: ~10 ms conv layers, ~9 ms attention
@@ -109,15 +113,18 @@ is fed one token at a time for now.
 
 | | |
 |---|---|
-| Generation | **8.5 tok/s** |
-| Per token: linear layers | 107 ms in 113 calls, **59 of them on a different context than the call before** |
-| Per token: CPU ops | 8.4 ms |
-| Load (repack Q4_K / Q6_K, upload) | 7.6 s |
-| Logits vs. an fp32 CPU reference on the same weights | cosine 0.99993–0.99999, same top-1 at every step |
+| | four contexts (one per format and K) | **one context** |
+|---|---|---|
+| Generation | 8.5 tok/s | **11.0–11.9 tok/s** |
+| Per token: linear layers | 107 ms in 113 calls, 59 context switches | 77–81 ms in 113 calls, none |
+| Per token: CPU ops | 8.4 ms | 7.7–9.5 ms |
+| Logits vs. an fp32 CPU reference on the same weights | cosine ≥ 0.99993 | cosine ≥ 0.99989, same top-1 at every step |
 
-* The kernels themselves add up to ~63 ms per token (section 3b). The rest is context switching: the four GEMV
-  contexts (Q4_K and Q6_K, K = 2048 and 7680) alternate inside every layer. One context for all of them is the
-  next step, then fewer calls per layer.
+* With four contexts the layers alternated between Q4_K/Q6_K and K = 2048/7680 GEMVs, costing ~45 ms per token
+  in context switches; the merged kernel removes them.
+* The kernels add up to ~69 ms per token; the remaining ~10 ms of linear time is host work per call (writing x
+  and the header, syncing buffers). Next: fewer calls per layer (q/k/v and the whole FFN in one dispatch), then a
+  batched prompt path.
 * llama.cpp's greedy output for the same prompt diverges after a few tokens where two candidates are close.
   At that step both the fp32 reference and llama.cpp's own prompt evaluation rank our token first; llama.cpp's
   CPU decode path rounds activations to 8 bits, so its token-by-token output differs slightly from its own

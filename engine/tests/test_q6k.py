@@ -5,7 +5,7 @@ import pytest
 from gguf import GGMLQuantizationType
 from gguf.quants import dequantize as gguf_dequantize
 
-from xdna1_llm import q6k
+from xdna1_llm import q4k, q6k
 from xdna1_llm.bf16 import from_bf16
 
 
@@ -17,24 +17,28 @@ def random_q6k(n: int, k: int, seed: int = 0) -> np.ndarray:
 
 
 def unpack_tiles(tiles: np.ndarray, n: int, k: int) -> np.ndarray:
-    """Read the kernel's tile layout back into float weights (what q6gemv.cc computes, in numpy)."""
-    KC, TB, _ = q6k.layout(k)
-    RB, nc = q6k.RB, k // KC
-    t = tiles.reshape(n // RB, nc, TB)
+    """Read the kernel's tile layout back into float weights (what qgemv.cc computes, in numpy)."""
+    KC, nc = q6k.layout(k)
+    RB, kp = q6k.RB, nc * KC
+    t = tiles.reshape(n // RB, nc, q4k.TILE_BYTES)
     nib = t[..., : KC * 8].reshape(*t.shape[:2], KC // 2, RB)
     lo = np.stack([nib & 0x0F, nib >> 4], axis=-1)  # (block, chunk, k pair, row, k in pair)
-    lo = lo.transpose(0, 3, 1, 2, 4).reshape(n, k)
+    lo = lo.transpose(0, 3, 1, 2, 4).reshape(n, kp)
     hb = t[..., KC * 8 : KC * 12].reshape(*t.shape[:2], KC // 8, 2, RB)  # (block, chunk, 8k, side, row)
     h = np.stack([(hb >> s) & 3 for s in (0, 2, 4, 6)], axis=-1).reshape(*hb.shape, 2, 2)  # (.., quad, k in pair)
-    h = h.transpose(0, 4, 1, 2, 5, 3, 6).reshape(n, k)  # (block, row, chunk, 8k, quad, side, k in pair)
+    h = h.transpose(0, 4, 1, 2, 5, 3, 6).reshape(n, kp)  # (block, row, chunk, 8k, quad, side, k in pair)
     q = lo | (h << 4)
     rest = t[..., KC * 12 :].copy().view(np.uint16)
     ng = KC // q6k.G
     sc = from_bf16(rest[..., : ng * RB]).reshape(*t.shape[:2], ng, RB).transpose(0, 3, 1, 2).reshape(n, -1)
-    dd = from_bf16(rest[..., ng * RB :]).reshape(*t.shape[:2], KC // q6k.QK, 2, RB).astype(np.float64)
+    dd = (
+        from_bf16(rest[..., ng * RB : (ng + KC // q6k.QK * 2) * RB])
+        .reshape(*t.shape[:2], KC // q6k.QK, 2, RB)
+        .astype(np.float64)
+    )
     d = (dd[..., 0, :] + dd[..., 1, :]).transpose(0, 3, 1, 2).reshape(n, -1)
     s = np.repeat(d, q6k.QK // q6k.G, axis=1) * sc
-    return (np.repeat(s, q6k.G, axis=1) * (q.astype(np.float64) - 32)).astype(np.float32)
+    return (np.repeat(s, q6k.G, axis=1) * (q.astype(np.float64) - 32)).astype(np.float32)[:, :k]
 
 
 def test_dequantize_matches_gguf():
