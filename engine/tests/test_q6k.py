@@ -1,0 +1,50 @@
+"""Q6_K unpacking and the NPU tile layout, checked against the gguf package's reference dequantizer."""
+
+import numpy as np
+import pytest
+from gguf import GGMLQuantizationType
+from gguf.quants import dequantize as gguf_dequantize
+
+from xdna1_llm import q6k
+from xdna1_llm.bf16 import from_bf16
+
+
+def random_q6k(n: int, k: int, seed: int = 0) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    raw = rng.integers(0, 256, size=(n, k // q6k.QK, q6k.BLOCK_BYTES), dtype=np.uint8)
+    raw[..., 208:210] = rng.uniform(1e-5, 1e-4, size=(n, k // q6k.QK)).astype(np.float16)[..., None].view(np.uint8)
+    return raw.reshape(n, -1)
+
+
+def unpack_tiles(tiles: np.ndarray, n: int, k: int) -> np.ndarray:
+    """Read the kernel's tile layout back into float weights (what q6gemv.cc computes, in numpy)."""
+    KC, TB, _ = q6k.layout(k)
+    RB, nc = q6k.RB, k // KC
+    t = tiles.reshape(n // RB, nc, TB)
+    nib = t[..., : KC * 8].reshape(*t.shape[:2], KC // 2, RB)
+    lo = np.stack([nib & 0x0F, nib >> 4], axis=-1)  # (block, chunk, k pair, row, k in pair)
+    lo = lo.transpose(0, 3, 1, 2, 4).reshape(n, k)
+    hb = t[..., KC * 8 : KC * 12].reshape(*t.shape[:2], KC // 8, 2, RB)  # (block, chunk, 8k, side, row)
+    h = np.stack([(hb >> s) & 3 for s in (0, 2, 4, 6)], axis=-1).reshape(*hb.shape, 2, 2)  # (.., quad, k in pair)
+    h = h.transpose(0, 4, 1, 2, 5, 3, 6).reshape(n, k)  # (block, row, chunk, 8k, quad, side, k in pair)
+    q = lo | (h << 4)
+    rest = t[..., KC * 12 :].copy().view(np.uint16)
+    ng = KC // q6k.G
+    sc = from_bf16(rest[..., : ng * RB]).reshape(*t.shape[:2], ng, RB).transpose(0, 3, 1, 2).reshape(n, -1)
+    dd = from_bf16(rest[..., ng * RB :]).reshape(*t.shape[:2], KC // q6k.QK, 2, RB).astype(np.float64)
+    d = (dd[..., 0, :] + dd[..., 1, :]).transpose(0, 3, 1, 2).reshape(n, -1)
+    s = np.repeat(d, q6k.QK // q6k.G, axis=1) * sc
+    return (np.repeat(s, q6k.G, axis=1) * (q.astype(np.float64) - 32)).astype(np.float32)
+
+
+def test_dequantize_matches_gguf():
+    raw = random_q6k(32, 512)
+    ref = gguf_dequantize(raw, GGMLQuantizationType.Q6_K)
+    np.testing.assert_array_equal(q6k.dequantize(raw), ref)
+
+
+@pytest.mark.parametrize("k", [512, 2048, 7680])
+def test_repack_is_lossless(k):
+    n = 32
+    raw = random_q6k(n, k, seed=k)
+    np.testing.assert_array_equal(unpack_tiles(q6k.repack(raw), n, k), q6k.dequantize(raw))

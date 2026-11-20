@@ -42,7 +42,7 @@ Everything below was measured on a Ryzen 7 250 (XDNA1, "NPU Phoenix"), Windows 1
 ## 3b. Decode GEMV (M = 1)
 
 `kernels/designs/stream_bw.py` streams host memory into cores with no compute. `kernels/designs/gemv.py` (bf16) and
-`kernels/designs/q4gemv.py` (4-bit) are the decode GEMVs: 8 lanes (two shim channels per column, cores in rows
+`kernels/designs/qgemv.py` (GGUF Q4_K and Q6_K) are the decode GEMVs: 8 lanes (two shim channels per column, cores in rows
 2–3), each lane owning N/8 rows, with the activation and the tile count sent on the same lane ahead of the
 weights. Because the cores read the tile count from the data, one xclbin per K serves every N; only the
 instruction stream changes. Medians of 50 runs, including dispatch, all sizes of a K in one hardware context.
@@ -59,7 +59,7 @@ instruction stream changes. Medians of 50 runs, including dispatch, all sizes of
 | FFN gate+up 15360×2048 | 2.23 ms | 28.2 GB/s |
 | FFN down 2048×7680 | 1.16 ms | 27.1 GB/s |
 
-4-bit (Q4_K) GEMV, `benchmarks/bench_q4gemv.py`, on real tensors from `LFM3-1.7B-Q4_K_M.gguf` where the shape
+Quantized GEMVs, `benchmarks/bench_qgemv.py`, on real tensors from `LFM3-1.7B-Q4_K_M.gguf` where the shape
 exists in the model:
 
 | Q4_K shape (N×K) | bytes | time | weights/s | max rel err vs GGUF |
@@ -72,7 +72,13 @@ exists in the model:
 | FFN down 2048×7680 | 9.8 MB | 0.57 ms | 27.7 G/s | 1.5e-4 |
 | LM-head size 128000×2048 (random) | 164 MB | **5.9 ms** | **44.4 G/s** | 4e-5 |
 
-* bf16 matches numpy to ~2e-7. The 4-bit kernel is checked against an fp64 product with the GGUF
+| Q6_K shape (N×K) | bytes | time | weights/s | max rel err vs GGUF |
+|---|---|---|---|---|
+| attn v 512×2048 | 0.9 MB | 0.21 ms | 5.0 G/s | 2e-5 |
+| FFN down 2048×7680 | 13.4 MB | 0.81–0.86 ms | 18.8 G/s | 1e-5 |
+| LM head (`token_embd`) 128000×2048 | 223 MB | **9.5 ms** | **27.5 G/s** | 2e-5 |
+
+* bf16 matches numpy to ~2e-7. The quantized kernels are checked against an fp64 product with the GGUF
   dequantization (`gguf.quants`); the remaining ~1e-4 is fp32 rounding.
 * Switching instruction streams inside one context costs nothing: alternating 2048- and 15360-row calls takes
   exactly the average of the two.
@@ -82,14 +88,18 @@ exists in the model:
   `d·sc` into one bf16 instead costs ~1 % error on real weights. Nibbles become bf16 exactly via the exponent
   trick (`0x4300 | q` = 128 + q). AIE2 emulates fp32 multiplies, so every scaling step uses native bf16 MACs on
   high/low bf16 parts: that change alone took the kernel from 17.5 to 35 G weights/s.
+* 6-bit layout: Q6_K's low 4 bits are stored like the Q4_K nibbles and its high 2 bits packed four per byte in
+  the lane order the nibble vectors already use, so merging them is a few byte-wise shifts and masks; the int8
+  group scales and the fp16 scale are stored as in the 4-bit layout (7.1 bits per weight; the GGUF file is 6.56).
+  The extra unpacking makes the 6-bit kernel compute-bound at mid sizes (16 GB/s on FFN down) while the LM head
+  streams at 23 GB/s.
 * Long rows (K = 7680) are split into 1536-column tiles; the core keeps the partial sums between them. Each
   16-row block's outputs stream back as soon as they are done, so N is not limited by core memory.
 * Each call carries ~0.15–0.2 ms of fixed cost, which is why small shapes reach less. Fusing calls per layer
   removes most of it.
 * Estimated LFM3-1.7B 4-bit decode at these rates, one call per projection: ~10 ms conv layers, ~9 ms attention
-  projections, ~35 ms FFN, ~6 ms LM head, so ~60 ms or **~16 tok/s** before fusing. bf16 with the same scheme
-  is ~7 tok/s. Not yet measured end to end. In Q4_K_M the LM head (tied to `token_embd`), 11 of 24 `ffn_down`
-  and 5 `attn_v` are Q6_K, which this kernel does not read yet.
+  projections, ~38 ms FFN (11 of 24 `ffn_down` are Q6_K), ~9.5 ms LM head (Q6_K, tied to `token_embd`), so
+  ~67 ms or **~15 tok/s** before fusing. bf16 with the same scheme is ~7 tok/s. Not yet measured end to end.
 
 ## 4. LFM3-1.7B prefill with linears on the NPU
 

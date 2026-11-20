@@ -47,9 +47,9 @@ These come from measurements in [benchmarks.md](benchmarks.md):
 
 * **GEMV design** for M=1: done (`kernels/designs/gemv.py`), 8 lanes, 14–28 GB/s, exact against numpy. One xclbin
   per K serves every N through per-N instruction streams, so all projections of a K share one context.
-* **4-bit GEMV** (`kernels/designs/q4gemv.py`): reads Q4_K repacked at load (`xdna1_llm/q4k.py`), every LFM3
-  Q4_K shape including FFN down (K = 7680) and LM-head-sized N, 15–44 G weights/s, ~1e-4 from the GGUF
-  dequantization. Remaining: Q6_K tensors, fewer dispatches.
+* **Quantized GEMVs** (`kernels/designs/qgemv.py`): read Q4_K and Q6_K repacked at load (`xdna1_llm/q4k.py`,
+  `q6k.py`), every LFM3 Q4_K_M tensor shape including FFN down (K = 7680) and the 128000-row LM head,
+  ~1e-4 from the GGUF dequantization. Remaining: fewer dispatches, a faster 6-bit unpack.
 * State in NPU-visible buffers across calls: the KV cache for the 11 attention layers (bf16, 4 KV heads × 128)
   and a 6-token rolling buffer for each of the 13 short-conv layers.
 
@@ -64,12 +64,12 @@ GGUF Q4_K_M mixes **Q4_K** (most tensors) and **Q6_K** (for LFM3-1.7B: `token_em
 | Q6_K | 256 weights = 16 sub-blocks × 16 | 128 B low 4 bits, 64 B high 2 bits, 16 int8 scales, fp16 `d` | 6.56 |
 
 1. **Repack at load** (one time): reorder super-blocks into the tile order the kernels consume and unpack the
-   6-bit scales/mins (`w = d·sc·q − dmin·m`). Done for Q4_K (`xdna1_llm/q4k.py`), lossless; tested against
-   `gguf.quants`.
+   6-bit scales/mins (`w = d·sc·q − dmin·m`). Done for Q4_K and Q6_K (`xdna1_llm/q4k.py`, `q6k.py`),
+   lossless; tested against `gguf.quants`.
 2. **W4A16 kernel:** unpack nibbles in the vector unit, apply the group scale and min, then bf16 `mmul`.
 3. **Optional W4A8:** AIE2's int4 × int8 MAC modes with per-token int8 activations. Faster, slightly different
    numerics; benchmark against (2).
-4. Q6_K: same structure with a 6-bit unpack, or repack to an 8-bit group format at load.
+4. Q6_K: same structure with a 6-bit unpack. Done for decode (`kernels/designs/q6gemv.cc`).
 
 ## M5–M6: server, app, installer
 

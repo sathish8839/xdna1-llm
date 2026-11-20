@@ -3,7 +3,7 @@
 #
 #   MLIR_AIE=~/mlir-aie XRT_SDK_WIN=/mnt/c/.../xrt_sdk/xrt ./kernels/build_kernels.sh [out_dir] [set]
 #
-# sets: engine (default: the two chunk GEMMs the engine needs), gemv / q4gemv (bf16 / 4-bit decode GEMVs),
+# sets: engine (default: the two chunk GEMMs the engine needs), gemv / qgemv (bf16 / Q4_K + Q6_K decode GEMVs),
 #       bw (streaming probes),
 #       shapes (per-shape GEMM benchmark kernels), smoke, all
 # Requires: an mlir-aie checkout with its ironenv (utils/env_install.sh) and xclbinutil on PATH
@@ -92,9 +92,13 @@ if [[ "$SET" == gemv || "$SET" == all ]]; then
     design "gemv_$shape" gemv.py -N "${shape%x*}" -K "${shape#*x}"
   done
 fi
-if [[ "$SET" == q4gemv || "$SET" == all ]]; then
-  for shape in 512x2048 2048x2048 6144x2048 7680x2048 15360x2048 128000x2048 2048x7680; do  # one context per K:
-    design "q4_$shape" q4gemv.py -N "${shape%x*}" -K "${shape#*x}"  # largest N's xclbin + every N's insts
+if [[ "$SET" == qgemv || "$SET" == all ]]; then
+  # one context per (format, K): the largest N's xclbin plus every N's instruction stream
+  for shape in 512x2048 2048x2048 6144x2048 7680x2048 15360x2048 2048x7680; do  # Q4_K tensors
+    design "q4_$shape" qgemv.py -Q 4 -N "${shape%x*}" -K "${shape#*x}"
+  done
+  for shape in 512x2048 128000x2048 2048x7680; do  # Q6_K: attn_v, LM head, ffn_down
+    design "q6_$shape" qgemv.py -Q 6 -N "${shape%x*}" -K "${shape#*x}"
   done
 fi
 if [[ "$SET" == bw || "$SET" == all ]]; then

@@ -1,14 +1,15 @@
-"""4-bit GEMV for decode on npu1 (layout and math in q4gemv.cc): y[N] (fp32) = W[N, K] (4-bit) . x[K] (bf16).
+"""Quantized GEMV for decode on npu1: y[N] (fp32) = W[N, K] . x[K] (bf16), with W in GGUF Q4_K (-Q 4, math in
+q4gemv.cc) or Q6_K (-Q 6, q6gemv.cc), repacked at load by xdna1_llm.q4k / xdna1_llm.q6k.
 
 Weights stream over 8 lanes (two shim channels per column, cores in rows 2 and 3); each lane owns N/8
-contiguous rows, in blocks of 16 rows. A block is split along K into tiles of KC columns (nibbles plus Q4_K's
-scales, 5.25 bits per weight; see q4gemv.cc) so long rows fit in core memory; the
-core carries partial sums across a block's tiles and streams the block's 16 outputs back as soon as it is done.
+contiguous rows, in blocks of 16 rows. A block is split along K into tiles of KC columns (bits plus the
+format's scales) so long rows fit in core memory; the core carries partial sums across a block's tiles and
+streams the block's 16 outputs back as soon as it is done.
 
 x travels on the same lane, ahead of the weights, with the number of blocks to expect. So the core program does
-not depend on N: one xclbin per K serves every N, and only the instruction stream differs.
+not depend on N: one xclbin per (format, K) serves every N, and only the instruction stream differs.
 
-    python q4gemv.py --dev npu -N 2048 -K 2048 --xclbin-path X --insts-path Y
+    python qgemv.py --dev npu -Q 4 -N 2048 -K 2048 --xclbin-path X --insts-path Y
 """
 
 import argparse
@@ -27,23 +28,26 @@ from ml_dtypes import bfloat16
 
 LANES = 8
 RB = 16  # rows per block
-SRC = str(Path(__file__).parent / "q4gemv.cc")
+QK = 256  # weights per GGUF super-block
 
 
-def layout(K: int) -> tuple[int, int, int]:
-    """(KC, tile bytes, x tiles): K per tile (at most 2048, at most 1536 when K must be split), the tile size,
-    and how many tiles carry x plus the 4-byte block count."""
-    KC = K if K <= 2048 else max(d for d in range(256, 1537, 256) if K % d == 0)
-    TB = KC // 2 * RB + KC // 32 * 2 * RB * 2 + KC // 256 * 4 * RB * 2
-    XT = -(-(2 * K + 4) // TB)
-    return KC, TB, XT
+def layout(Q: int, K: int) -> tuple[int, int, int]:
+    """(KC, tile bytes, x tiles): K per tile, the tile size, and how many tiles carry x plus the 4-byte block
+    count. Two tiles are in flight per core, so a tile stays under ~22 KB next to x (up to 15 KB)."""
+    if Q == 4:  # nibbles, per 32 k: sc + mn, per 256 k: d and dmin as hi + lo
+        KC = K if K <= 2048 else max(d for d in range(QK, 1537, QK) if K % d == 0)
+        TB = KC // 2 * RB + KC // 32 * 2 * RB * 2 + KC // QK * 4 * RB * 2
+    else:  # low nibbles, high 2 bits, per 16 k: sc, per 256 k: d as hi + lo
+        KC = max(d for d in range(QK, 1281, QK) if K % d == 0)
+        TB = KC // 2 * RB + KC // 8 * 32 + KC // 16 * RB * 2 + KC // QK * 2 * RB * 2
+    return KC, TB, -(-(2 * K + 4) // TB)
 
 
 @iron.jit
-def q4gemv(W: In, X: In, Y: Out, *, N: CompileTime[int], K: CompileTime[int]):
-    KC, TB, XT = layout(K)
+def qgemv(W: In, X: In, Y: Out, *, Q: CompileTime[int], N: CompileTime[int], K: CompileTime[int]):
+    KC, TB, XT = layout(Q, K)
     NC = K // KC
-    assert N % (LANES * RB) == 0 and K % 256 == 0, (N, K)
+    assert Q in (4, 6) and N % (LANES * RB) == 0 and K % QK == 0, (Q, N, K)
 
     u8 = np.dtype[np.uint8]
     tile_ty = np.ndarray[(TB,), u8]
@@ -51,15 +55,17 @@ def q4gemv(W: In, X: In, Y: Out, *, N: CompileTime[int], K: CompileTime[int]):
     cnt_ty = np.ndarray[(1,), np.dtype[np.int32]]
     y_ty = np.ndarray[(RB,), np.dtype[np.float32]]
 
-    flags = [f"-DQ4_K={K}", f"-DQ4_KC={KC}", f"-DQ4_TB={TB}", f"-DQ4_XT={XT}"]
+    p = f"Q{Q}"
+    src = str(Path(__file__).parent / f"q{Q}gemv.cc")
+    flags = [f"-D{p}_K={K}", f"-D{p}_KC={KC}", f"-D{p}_TB={TB}", f"-D{p}_XT={XT}"]
     load_x = ExternalFunction(
-        "q4_load_x", source_file=SRC, arg_types=[tile_ty, x_ty, cnt_ty], compile_flags=flags + ["-DQ4_FN=0"]
+        f"q{Q}_load_x", source_file=src, arg_types=[tile_ty, x_ty, cnt_ty], compile_flags=flags + [f"-D{p}_FN=0"]
     )
-    q4_rows = ExternalFunction(
-        "q4_rows", source_file=SRC, arg_types=[tile_ty, x_ty, y_ty], compile_flags=flags + ["-DQ4_FN=1"]
+    rows = ExternalFunction(
+        f"q{Q}_rows", source_file=src, arg_types=[tile_ty, x_ty, y_ty], compile_flags=flags + [f"-D{p}_FN=1"]
     )
 
-    def core_fn(of_in, of_out, xbuf, cnt, load_x, q4_rows):
+    def core_fn(of_in, of_out, xbuf, cnt, load_x, rows):
         for _ in range_(XT):
             t = of_in.acquire(1)
             load_x(t, xbuf, cnt)
@@ -68,7 +74,7 @@ def q4gemv(W: In, X: In, Y: Out, *, N: CompileTime[int], K: CompileTime[int]):
             y = of_out.acquire(1)
             for _ in range_(NC):
                 t = of_in.acquire(1)
-                q4_rows(t, xbuf, y)
+                rows(t, xbuf, y)
                 of_in.release(1)
             of_out.release(1)
 
@@ -81,9 +87,7 @@ def q4gemv(W: In, X: In, Y: Out, *, N: CompileTime[int], K: CompileTime[int]):
         outs.append(fout.cons(tile=Tile(col=col, row=0)))
         xbuf = Buffer(type=x_ty, name=f"x{lane}")
         cnt = Buffer(type=cnt_ty, name=f"n{lane}")
-        workers.append(
-            Worker(core_fn, [fin.cons(), fout.prod(), xbuf, cnt, load_x, q4_rows], tile=Tile(col=col, row=row))
-        )
+        workers.append(Worker(core_fn, [fin.cons(), fout.prod(), xbuf, cnt, load_x, rows], tile=Tile(col=col, row=row)))
 
     n_bytes = N // RB * NC * TB
     w_taps = TensorAccessPattern.full((n_bytes,)).partition(LANES)
@@ -102,15 +106,16 @@ def q4gemv(W: In, X: In, Y: Out, *, N: CompileTime[int], K: CompileTime[int]):
 
 
 def main():
-    p = argparse.ArgumentParser(prog="q4gemv")
+    p = argparse.ArgumentParser(prog="qgemv")
     add_compile_args(p)
+    p.add_argument("-Q", type=int, choices=(4, 6), required=True)
     p.add_argument("-N", type=int, required=True)
     p.add_argument("-K", type=int, required=True)
     opts = p.parse_args()
     run_design_cli(
-        q4gemv,
+        qgemv,
         opts,
-        compile_kwargs=lambda o: dict(N=o.N, K=o.K),
+        compile_kwargs=lambda o: dict(Q=o.Q, N=o.N, K=o.K),
         run_and_verify=lambda o: None,
         device=lambda o: device_from_args(o, n_cols=4),
     )

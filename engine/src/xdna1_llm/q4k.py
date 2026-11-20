@@ -45,7 +45,7 @@ def dequantize(raw: np.ndarray) -> np.ndarray:
 
 
 def layout(K: int) -> tuple[int, int, int]:
-    """(k per tile, tile bytes, tiles that carry x); must match kernels/designs/q4gemv.py."""
+    """(k per tile, tile bytes, tiles that carry x); must match kernels/designs/qgemv.py."""
     KC = K if K <= 2048 else max(d for d in range(QK, 1537, QK) if K % d == 0)
     TB = KC // 2 * RB + KC // G * 2 * RB * 2 + KC // QK * 4 * RB * 2
     return KC, TB, -(-(2 * K + 4) // TB)
