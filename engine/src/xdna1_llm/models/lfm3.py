@@ -10,8 +10,13 @@ Forward-pass math (checked against llama.cpp output, see docs/benchmarks.md):
   head:       RMS(h, output_norm) @ token_embd^T (tied)
 Linear layers go through the backend; everything else runs here in numpy (fp32).
 
-`forward` is prefill (all prompt tokens at once). `step` is decode: one token, with the attention keys/values
-and the last 6 short-conv inputs of each layer carried in a `State`.
+`forward` is prefill: many tokens per call, in chunks of up to 256. `step` is decode: one token. Both read and
+extend a `State` (the attention keys/values and the last 6 short-conv inputs of each layer), so a prompt can be
+prefilled in one batch and then continued token by token.
+
+Two linear backends: `lin` serves decode (and prefill when there is no other), `prefill_lin` (optional) serves
+prompt chunks of at least PREFILL_MIN tokens. For a Q4_K_M / Q6_K model on the NPU, `lin` is the quantized GEMV
+(one token per call) and `prefill_lin` the bf16 GEMM, which gets a bf16 copy of every linear weight at load.
 """
 
 from __future__ import annotations
@@ -21,9 +26,12 @@ from functools import partial
 
 import numpy as np
 
-from ..gguf_weights import dequantize
+from ..bf16 import to_bf16
+from ..gguf_weights import as_parts, dequantize
 
 EPS, LCONV, SWA_WINDOW = 1e-5, 7, 256
+CHUNK = 256  # prefill rows per pass (the bf16 GEMM's tile)
+PREFILL_MIN = 32  # shorter prompt chunks run on `lin`: the GEMM always computes 256 rows
 
 
 def rms(x, w):
@@ -66,10 +74,11 @@ class State:
 
 
 class LFM3:
-    def __init__(self, w, lin):
+    def __init__(self, w, lin, prefill_lin=None):
         if w.arch != "lfm3":
             raise ValueError(f"expected an lfm3 GGUF, got {w.arch!r}")
-        self.w, self.lin = w, lin
+        self.w, self.lin, self.prefill_lin = w, lin, prefill_lin
+        self.cur = lin  # the backend the running pass uses
         a = "lfm3."
         self.n_layers = int(w.scalar(a + "block_count"))
         self.d = int(w.scalar(a + "embedding_length"))
@@ -86,23 +95,29 @@ class LFM3:
 
         self.p: dict[str, np.ndarray] = {}
         t0 = time.perf_counter()
+
+        def register(name, wt):
+            lin.register(name, wt)
+            if prefill_lin is not None:
+                prefill_lin.register(name, _as_bf16(wt))
+
         for i in range(self.n_layers):
             b = f"blk.{i}."
             for n in ("attn_norm", "post_attention_norm", "ffn_norm", "post_ffw_norm"):
                 self.p[b + n] = w.f32(b + n + ".weight")
             if self.kind(i) == "conv":
-                lin.register(b + "in_proj", w.tensor(b + "shortconv.in_proj.weight"))
-                lin.register(b + "out_proj", w.tensor(b + "shortconv.out_proj.weight"))
+                register(b + "in_proj", w.tensor(b + "shortconv.in_proj.weight"))
+                register(b + "out_proj", w.tensor(b + "shortconv.out_proj.weight"))
                 self.p[b + "conv"] = w.f32(b + "shortconv.conv.weight")  # (D, 7), k=6 is the newest token
             else:
                 qkv = [w.tensor(b + f"attn_{n}.weight") for n in "qkv"]
-                lin.register(b + "qkv", qkv)  # one weight with stacked rows: q (nh*hd), k, v (nkv*hd each)
-                lin.register(b + "o", w.tensor(b + "attn_output.weight"))
+                register(b + "qkv", qkv)  # one weight with stacked rows: q (nh*hd), k, v (nkv*hd each)
+                register(b + "o", w.tensor(b + "attn_output.weight"))
                 self.p[b + "gate"] = w.f32(b + "attn_gate.weight")  # (H, D)
                 self.p[b + "q_norm"] = w.f32(b + "attn_q_norm.weight")
                 self.p[b + "k_norm"] = w.f32(b + "attn_k_norm.weight")
-            lin.register(b + "gateup", [w.tensor(b + "ffn_gate.weight"), w.tensor(b + "ffn_up.weight")])
-            lin.register(b + "down", w.tensor(b + "ffn_down.weight"))
+            register(b + "gateup", [w.tensor(b + "ffn_gate.weight"), w.tensor(b + "ffn_up.weight")])
+            register(b + "down", w.tensor(b + "ffn_down.weight"))
         self.out_norm = w.f32("output_norm.weight")
         self.embd = w.tensor("token_embd.weight")  # (type, data); rows are tokens
         if lin.wants_head:
@@ -139,38 +154,41 @@ class LFM3:
         return rope_tables(T, self.hd, self.base_swa, self.hd // 2, start)
 
     # ---- prefill
-    def _conv(self, b, u):
-        P = self.lin(b + "in_proj", u)
+    def _conv(self, b, i, u, st):
+        P = self.cur(b + "in_proj", u)
         t0 = time.perf_counter()
         d = self.d
         Bg, Cg, X = P[:, :d], P[:, d : 2 * d], P[:, 2 * d :]
         z = Bg * X
         wc = self.p[b + "conv"]
-        zp = np.concatenate([np.zeros((LCONV - 1, d), np.float32), z], 0)
+        zp = np.concatenate([st.conv[i], z], 0)  # the previous 6 inputs, then this chunk's
         y = np.zeros_like(z)
         for k in range(LCONV):
             y += wc[:, k][None, :] * zp[k : k + z.shape[0]]
+        st.conv[i] = zp[-(LCONV - 1) :]
         g = Cg * y
         self.cpu_ms += (time.perf_counter() - t0) * 1e3
-        return self.lin(b + "out_proj", g)
+        return self.cur(b + "out_proj", g)
 
-    def _attn(self, b, u, kind):
-        T, nh, hd = u.shape[0], self.nh, self.hd
-        nkv = self.kv_heads[int(b.split(".")[1])]
-        qkv = self.lin(b + "qkv", u)
+    def _attn(self, b, i, u, kind, st):
+        T, nh, hd, nkv, p0 = u.shape[0], self.nh, self.hd, self.kv_heads[i], st.pos
+        qkv = self.cur(b + "qkv", u)
         t0 = time.perf_counter()
         q = rms(qkv[:, : nh * hd].reshape(T, nh, hd), self.p[b + "q_norm"])
         k = rms(qkv[:, nh * hd : (nh + nkv) * hd].reshape(T, nkv, hd), self.p[b + "k_norm"])
-        v = qkv[:, (nh + nkv) * hd :].reshape(T, nkv, hd)
-        cos, sin = self.rope(kind, T)
-        q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+        cos, sin = self.rope(kind, T, p0)
+        q = apply_rope(q, cos, sin)
+        st.k[i][p0 : p0 + T] = apply_rope(k, cos, sin)
+        st.v[i][p0 : p0 + T] = qkv[:, (nh + nkv) * hd :].reshape(T, nkv, hd)
+        lo = max(0, p0 - self.window + 1) if kind == "swa" else 0  # earlier keys are outside every query's window
         rep = nh // nkv
-        k, v = np.repeat(k, rep, axis=1), np.repeat(v, rep, axis=1)
+        k = np.repeat(st.k[i][lo : p0 + T], rep, axis=1)  # (L, nh, hd)
+        v = np.repeat(st.v[i][lo : p0 + T], rep, axis=1)
         s = np.matmul(q.transpose(1, 0, 2), k.transpose(1, 2, 0)) * np.float32(1.0 / np.sqrt(hd))
-        i, j = np.arange(T)[:, None], np.arange(T)[None, :]
-        mask = j > i
+        i_pos, j_pos = p0 + np.arange(T)[:, None], lo + np.arange(k.shape[0])[None, :]
+        mask = j_pos > i_pos
         if kind == "swa":
-            mask |= (i - j) >= self.window
+            mask |= (i_pos - j_pos) >= self.window
         s = np.where(mask[None], -np.inf, s)
         s = np.exp(s - s.max(-1, keepdims=True))
         s /= s.sum(-1, keepdims=True)
@@ -178,7 +196,7 @@ class LFM3:
         gate = 1.0 / (1.0 + np.exp(-(u @ self.p[b + "gate"].T)))
         o = (o * gate[:, :, None]).reshape(T, nh * hd)
         self.cpu_ms += (time.perf_counter() - t0) * 1e3
-        return self.lin(b + "o", o)
+        return self.cur(b + "o", o)
 
     def _block(self, b, h, mixer):
         """One layer around a token mixer (conv or attention): norms, residuals and the SwiGLU FFN."""
@@ -190,30 +208,46 @@ class LFM3:
         h = h + rms(o, self.p[b + "post_attention_norm"])
         u = rms(h, self.p[b + "ffn_norm"])
         self.cpu_ms += (time.perf_counter() - t0) * 1e3
-        gu = self.lin(b + "gateup", u)
+        gu = self.cur(b + "gateup", u)
         t0 = time.perf_counter()
         act = silu(gu[:, : self.ff]) * gu[:, self.ff :]
         self.cpu_ms += (time.perf_counter() - t0) * 1e3
-        f = self.lin(b + "down", act)
+        f = self.cur(b + "down", act)
         t0 = time.perf_counter()
         h = h + rms(f, self.p[b + "post_ffw_norm"])
         self.cpu_ms += (time.perf_counter() - t0) * 1e3
         return h
 
-    def forward(self, ids, keep_hidden: bool = False, all_logits: bool = False):
-        """Prefill: returns (logits of the last position, or of every position if all_logits, and the list of
-        per-layer hidden states if keep_hidden)."""
-        h = self.embed(ids)
-        hidden = []
-        for i in range(self.n_layers):
-            b, kind = f"blk.{i}.", self.kind(i)
-            if kind == "conv":
-                h = self._block(b, h, partial(self._conv, b))
-            else:
-                h = self._block(b, h, partial(self._attn, b, kind=kind))
-            if keep_hidden:
-                hidden.append(h.copy())
-        return (self.head(h) if all_logits else self.head(h[-1:])[0]), hidden
+    def forward(self, ids, st: State | None = None, keep_hidden: bool = False, all_logits: bool = False):
+        """Prefill `ids` at st.pos (a fresh state if None), in chunks of up to 256 tokens, extending the state.
+        Returns (logits of the last position, or of every position if all_logits, and the list of per-layer
+        hidden states if keep_hidden)."""
+        ids = np.asarray(ids)
+        st = st or self.new_state(len(ids))
+        if st.pos + len(ids) > st.max_len:
+            raise ValueError(f"context full ({st.pos} + {len(ids)} tokens > {st.max_len})")
+        logits, hidden = [], [[] for _ in range(self.n_layers)] if keep_hidden else []
+        for c in range(0, len(ids), CHUNK):
+            chunk = ids[c : c + CHUNK]
+            last = c + CHUNK >= len(ids)
+            self.cur = self.prefill_lin if self.prefill_lin is not None and len(chunk) >= PREFILL_MIN else self.lin
+            try:
+                h = self.embed(chunk)
+                for i in range(self.n_layers):
+                    b, kind = f"blk.{i}.", self.kind(i)
+                    mixer = self._conv if kind == "conv" else partial(self._attn, kind=kind)
+                    h = self._block(b, h, partial(mixer, b, i, st=st))
+                    if keep_hidden:
+                        hidden[i].append(h.copy())
+            finally:
+                self.cur = self.lin
+            st.pos += len(chunk)
+            if all_logits:
+                logits.append(self.head(h))
+            elif last:
+                logits.append(self.head(h[-1:])[0])
+        hidden = [np.concatenate(parts) for parts in hidden] if keep_hidden else []
+        return (np.concatenate(logits) if all_logits else logits[-1]), hidden
 
     # ---- decode
     def new_state(self, max_len: int = 4096) -> State:
@@ -265,22 +299,30 @@ class LFM3:
         st.pos += 1
         return self.head(h)[0]
 
-    def generate(self, ids, n: int, st: State | None = None, on_token=None, logits_out: list | None = None, stop=()):
-        """Greedy decoding: feed the prompt one token at a time, then generate up to n tokens, ending early after a
-        token in `stop` (end-of-generation ids). Returns (new token ids, state, prompt seconds, generation seconds)."""
+    def generate(
+        self, ids, n: int, st: State | None = None, on_token=None, logits_out: list | None = None, stop=(), sample=None
+    ):
+        """Prefill the prompt (`forward`), then generate up to n tokens, ending early after a token in `stop`
+        (end-of-generation ids). `sample(logits, history)` picks each token (a xdna1_llm.sampling.Sampler); the
+        default is greedy. Returns (new token ids, state, prompt seconds, generation seconds)."""
         st = st or self.new_state()
         t0 = time.perf_counter()
-        for t in ids:
-            logits = self.step(int(t), st)
+        logits, _ = self.forward(ids, st)
         t1 = time.perf_counter()
-        out = []
+        out, history = [], [int(t) for t in ids]
         while True:
             if logits_out is not None:
                 logits_out.append(logits)
-            out.append(int(np.argmax(logits)))
+            out.append(int(np.argmax(logits)) if sample is None else sample(logits, history))
+            history.append(out[-1])
             if on_token:
                 on_token(out[-1])
             if len(out) == n or out[-1] in stop:
                 break
             logits = self.step(out[-1], st)
         return out, st, t1 - t0, time.perf_counter() - t1
+
+
+def _as_bf16(wt):
+    """A weight (or stacked parts) as bf16 bits for the GEMM backend, dequantizing GGUF types."""
+    return [("BF16", d if k == "BF16" else to_bf16(dequantize(k, d))) for k, d in as_parts(wt)]

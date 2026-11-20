@@ -75,7 +75,7 @@ From [LiquidAI/LFM3-1.7B-GGUF](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF):
 
 ```powershell
 cd engine; python -m pytest -rs; cd ..
-xdna1-llm --gguf <gguf> --chat --prompt "Hello" --generate 100
+xdna1-llm --gguf <gguf> --chat --prompt "Hello" --generate 100 --sample   # greedy without --sample
 xdna1-llm --gguf <gguf> --llama-server <llama-server.exe> --compare
 python benchmarks\bench_shapes.py
 python benchmarks\power_bench.py --gguf <gguf> --llama-server <llama-server.exe>

@@ -7,6 +7,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Batched prompt: `LFM3.forward` prefills in chunks into the decode state, and `--generate` runs prompt chunks of
+  32–256 tokens on the bf16 GEMM with a bf16 copy of the weights (689 tokens: 38.6 → 5.1 s; +2.9 GB RAM, +25 s
+  load; KLD 0.00005 against the CPU). `--no-gemm-prompt` keeps the old token-by-token path.
+- Sampling (`xdna1_llm.sampling`): repetition penalty, top-k, top-p, min-p and temperature, in llama.cpp's order,
+  defaulting to the model's recommended values from the GGUF. CLI: `--sample`, `--temperature`, `--top-k`,
+  `--top-p`, `--min-p`, `--repeat-penalty`, `--seed`; greedy otherwise.
 - Native tokenizer (`xdna1_llm.tokenizer`): byte-level BPE read from the GGUF with the Llama 3 pre-tokenizer,
   identical to llama.cpp token for token (`benchmarks/check_tokenizer.py`). Chat template in Python
   (`xdna1_llm.chat`: thinking, tools, tool results), identical to the GGUF's Jinja template. `xdna1-llm --chat`

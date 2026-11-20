@@ -23,7 +23,7 @@ and aims for the Q4_K_M quant running entirely on the NPU, behind:
 
 > [!IMPORTANT]
 > **Pre-alpha.** Prefill and token generation (Q4_K_M or Q6_K) run on the NPU and match a CPU reference, with
-> the model's own tokenizer and chat template. Sampling, the server and the app are still being built. See the [roadmap](docs/roadmap.md).
+> the model's own tokenizer and chat template. The server and the app are still being built. See the [roadmap](docs/roadmap.md).
 
 ## Results so far
 
@@ -44,9 +44,9 @@ That is **1.6× faster and 2.5× less energy than the CPU, with the CPU nearly f
 |---|---|
 | NPU kernels compiled with mlir-aie, running on the **Windows** NPU driver | ✅ |
 | Prefill with every linear layer on the NPU (bf16) | ✅ |
-| Native tokenizer and chat template (identical to llama.cpp / the Jinja template), greedy generation loop | ✅ |
-| Sampling (temperature, top-k/top-p) | ⏳ next |
+| Native tokenizer and chat template (identical to llama.cpp / the Jinja template), generation with sampling | ✅ |
 | Decode on the NPU (KV cache): **Q4_K_M** ~14–15 tok/s, or **Q6_K** ~12–13 tok/s at near-BF16 accuracy | ✅ |
+| Batched prompt on the NPU: ~135 tok/s (689 tokens in 5 s) | ✅ |
 | Accuracy harness: perplexity and KL divergence vs BF16; NPU engine adds ~0 on top of the GGUF | ✅ |
 | OpenAI-compatible server (streaming, tool calls) | ⏳ |
 | Windows app (chat, thinking toggle, web search) and installer | ⏳ |
@@ -74,7 +74,7 @@ uv venv --python 3.13 .venv; .venv\Scripts\activate
 uv pip install -e ".[dev]"
 copy <xrt_sdk>\xrt\python\pyxrt.pyd .venv\Lib\site-packages\
 python -m pytest -rs                       # CPU tests, plus NPU tests when kernels are built
-xdna1-llm --gguf LFM3-1.7B-Q4_K_M.gguf --chat --prompt "Name three rivers." --generate 200  # chat (or Q6_K)
+xdna1-llm --gguf LFM3-1.7B-Q4_K_M.gguf --chat --prompt "Name three rivers." --generate 200 --sample  # chat (or Q6_K)
 xdna1-llm --gguf LFM3-1.7B-BF16.gguf --compare --llama-server <llama-server.exe>   # prefill vs CPU and llama.cpp
 ```
 

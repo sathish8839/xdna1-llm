@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -79,9 +81,9 @@ def test_short_conv_matches_naive_causal_convolution():
         def __call__(self, name, x):
             return x
 
-    m.lin = Identity()
+    m.cur = Identity()
     P = rng.standard_normal((T, 3 * d)).astype(np.float32)
-    out = m._conv("b.", P)
+    out = m._conv("b.", 0, P, conv_state(d))
 
     B, C, X = P[:, :d], P[:, d : 2 * d], P[:, 2 * d :]
     z = B * X
@@ -100,8 +102,25 @@ def test_conv_is_causal(T):
     m = object.__new__(LFM3)
     m.d, m.cpu_ms = d, 0.0
     m.p = {"b.conv": rng.standard_normal((d, LCONV)).astype(np.float32)}
-    m.lin = lambda name, x: x
+    m.cur = lambda name, x: x
     P = rng.standard_normal((T + 3, 3 * d)).astype(np.float32)
-    full = m._conv("b.", P)
-    prefix = m._conv("b.", P[:T])
+    full = m._conv("b.", 0, P, conv_state(d))
+    prefix = m._conv("b.", 0, P[:T], conv_state(d))
     np.testing.assert_allclose(full[:T], prefix, rtol=1e-6)
+
+
+def test_conv_state_carries_across_chunks():
+    d = 4
+    m = object.__new__(LFM3)
+    m.d, m.cpu_ms = d, 0.0
+    m.p = {"b.conv": rng.standard_normal((d, LCONV)).astype(np.float32)}
+    m.cur = lambda name, x: x
+    P = rng.standard_normal((10, 3 * d)).astype(np.float32)
+    whole = m._conv("b.", 0, P, conv_state(d))
+    st = conv_state(d)
+    parts = np.concatenate([m._conv("b.", 0, P[:3], st), m._conv("b.", 0, P[3:], st)])
+    np.testing.assert_allclose(parts, whole, rtol=1e-6)
+
+
+def conv_state(d):
+    return SimpleNamespace(conv={0: np.zeros((LCONV - 1, d), np.float32)})

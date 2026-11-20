@@ -86,3 +86,24 @@ def test_generate_is_greedy_over_step():
         expect.append(int(np.argmax(logits)))
         logits = m.step(expect[-1], st2)
     assert out == expect and st.pos == 3 + 3
+
+
+def test_chunked_prefill_then_decode_matches_step_by_step(monkeypatch):
+    from xdna1_llm.models import lfm3
+
+    monkeypatch.setattr(lfm3, "CHUNK", 4)  # 11 prompt tokens -> chunks of 4, 4, 3
+    monkeypatch.setattr(lfm3, "PREFILL_MIN", 3)  # every chunk runs on the prefill backend
+    prefill_lin = CpuLinear()
+    m = LFM3(TinyLfm3Weights(seed=3), CpuLinear(), prefill_lin=prefill_lin)
+    m.window = 5  # the sliding window drops keys across chunk boundaries
+    ids = np.random.default_rng(4).integers(0, 50, size=11)
+
+    st = m.new_state(max_len=32)
+    logits, _ = m.forward(ids, st)
+    ref_st = m.new_state(max_len=32)
+    for t in ids:
+        ref = m.step(int(t), ref_st)
+    np.testing.assert_allclose(logits, ref, rtol=1e-4, atol=1e-5)
+    assert st.pos == ref_st.pos == len(ids) and set(prefill_lin.mats) == set(m.lin.mats) - {"lm_head"}
+    for t in (5, 9, 2):  # decoding continues from the prefilled state
+        np.testing.assert_allclose(m.step(t, st), m.step(t, ref_st), rtol=1e-4, atol=1e-5)

@@ -133,7 +133,7 @@ runs, so ranges are given):
 
 `xdna1-llm --gguf LFM3-1.7B-Q4_K_M.gguf --generate 24 --compare`: every linear layer and the LM head run on the
 quantized GEMVs; norms, RoPE, attention over the KV cache and the short conv run on the CPU in numpy. The prompt
-is fed one token at a time for now.
+runs as a batch on the bf16 GEMM ([3d](#3d-batched-prompt)); the table below fed it one token at a time.
 
 | | |
 |---|---|
@@ -158,6 +158,24 @@ is fed one token at a time for now.
   At that step both the fp32 reference and llama.cpp's own prompt evaluation rank our token first; llama.cpp's
   CPU decode path rounds activations to 8 bits, so its token-by-token output differs slightly from its own
   batched evaluation.
+
+## 3d. Batched prompt
+
+The quantized GEMV takes one token per call, so a prompt fed through it runs at decode speed. `xdna1-llm
+--generate` instead runs prompt chunks of 32 to 256 tokens on the bf16 prefill GEMM (section 4), with a bf16 copy of
+every linear weight made at load, and decodes on the GEMV from the state the prompt left. Three contexts in all.
+
+| Q4_K_M, 689-token chat prompt | prompt | load | extra RAM |
+|---|---|---|---|
+| one token at a time on the GEMV (`--no-gemm-prompt`) | 38.6 s (17.9 tok/s) | 8.6 s | — |
+| **batched on the bf16 GEMM** | **5.1 s (135 tok/s)** | 33.7 s | 2.9 GB |
+
+* Both give the same greedy output. Accuracy against the CPU run of the same file ([section 6](#6-accuracy-what-quantization-costs)):
+  KLD 0.00005 (Q4_K_M) and 0.00004 (Q6_K), so rounding the dequantized weights to bf16 costs nothing measurable.
+* Chunks shorter than 32 tokens stay on the GEMV: the GEMM always computes 256 rows, which takes about as long
+  as ~25 single-token steps.
+* The cost is the copy: 2.9 GB more RAM and ~25 s more load (dequantizing and uploading). A GEMM that reads the
+  quantized tiles directly (roadmap M4, W4A16) would remove both.
 
 ## 4. LFM3-1.7B prefill with linears on the NPU
 
@@ -219,6 +237,8 @@ quantizations:
 | Q6_K on our NPU engine | | 6.099 | 0.0031 | 0.020 | 97.4 % |
 | *NPU engine vs the same Q4_K_M on the CPU* | | | *0.00002* | *0.0001* | *99.7 %* |
 | *NPU engine vs the same Q6_K on the CPU* | | | *0.00002* | *0.0002* | *99.7 %* |
+| *batched prompt (bf16 copy on the GEMM) vs the same Q4_K_M on the CPU* | | | *0.00005* | *0.0004* | *99.6 %* |
+| *batched prompt vs the same Q6_K on the CPU* | | | *0.00004* | *0.0002* | *99.7 %* |
 
 * **The engine adds nothing measurable.** Against the same GGUF weights in fp32 the NPU path's KLD is 0.00002,
   over 100× below what either format costs; the 0.3 % of tokens where the top-1 differs are near-ties.

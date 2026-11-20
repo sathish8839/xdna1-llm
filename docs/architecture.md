@@ -1,6 +1,6 @@
 # Architecture
 
-This describes what exists today. Planned parts (sampling, the server, the app) are in the
+This describes what exists today. Planned parts (the server, the app) are in the
 [roadmap](roadmap.md).
 
 ```
@@ -8,11 +8,12 @@ engine/src/xdna1_llm/
   npu/device.py      pyxrt wrapper: device, kernels (hw contexts), buffers, zero-copy numpy views
   npu/linear.py      NpuLinear: every projection as 1024-wide chunks on two fixed GEMM kernels
   cpu_linear.py      CpuLinear: the same interface in numpy, as a reference and fallback
-  models/lfm3.py     LFM3 forward pass (short conv, GQA attention, SwiGLU) over a linear backend
+  models/lfm3.py     LFM3: batched prefill and one-token decode over a shared state, on one or two linear backends
   gguf_weights.py    memory-mapped GGUF tensors (BF16, F32)
   bf16.py            float32 <-> bf16 bit conversion
   tokenizer.py       byte-level BPE from the GGUF (Llama 3 pre-tokenizer), identical to llama.cpp
   chat.py            LFM3's chat template (thinking, tools) in Python
+  sampling.py        next-token choice: greedy, or temperature / top-k / top-p / min-p / repetition penalty
   reference.py       llama-server client: the optional ground truth for tests and benchmarks
   cli.py             run a prompt or chat message on the NPU and/or CPU, optionally against llama.cpp
 kernels/build_kernels.sh   builds the xclbins from mlir-aie's whole_array GEMM example

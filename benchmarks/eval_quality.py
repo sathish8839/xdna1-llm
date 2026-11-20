@@ -1,12 +1,14 @@
 r"""What does quantization cost, and does our engine add anything on top? Scores next-token predictions on a text.
 
     python benchmarks/eval_quality.py --base LFM3-1.7B-BF16.gguf --quant LFM3-1.7B-Q4_K_M.gguf [more GGUFs] \
-        --llama-server llama-server.exe [--text benchmarks/data/eval.txt] [--npu]
+        [--text benchmarks/data/eval.txt] [--npu]
 
 Variants, all compared with `bf16` (the original weights in fp32 on the CPU, the reference):
   * one per --quant GGUF, named after its type (q4_k_m, q6_k, ...), in fp32 on the CPU: the cost of the format;
-  * with --npu, the first one again through the NPU decode path (`q4_k_m-npu`): its line against the CPU run of
-    the same file is the cost of our engine, which should be ~0.
+  * with --npu, the first one again on the NPU: through the decode path, one token at a time on the quantized
+    GEMV (`q4_k_m-npu`), and as a batched prompt on the bf16 GEMM with a bf16 copy of the weights
+    (`q4_k_m-gemm`). Their lines against the CPU run of the same file are the cost of our engine, which should
+    be ~0.
 Each chunk of the text starts from an empty context (metrics: xdna1_llm.quality). The CPU variants are slow
 (weights are dequantized on every call): ~1 min per 256-token chunk.
 """
@@ -56,7 +58,7 @@ def evaluate():
     ap.add_argument("--text", default=os.path.join(HERE, "data", "eval.txt"))
     ap.add_argument("--chunk", type=int, default=256)
     ap.add_argument("--tokens", type=int, help="score at most this many tokens of the text")
-    ap.add_argument("--npu", action="store_true", help="also run the first --quant on the NPU decode path")
+    ap.add_argument("--npu", action="store_true", help="also run the first --quant on the NPU (decode and prompt)")
     ap.add_argument("--kernels", help="directory with built xclbins")
     a = ap.parse_args()
 
@@ -73,11 +75,15 @@ def evaluate():
     first = list(variants)[1]
     pairs = [(v, "bf16") for v in variants]
     if a.npu:
-        from xdna1_llm.npu.qlinear import NpuQLinear  # imports pyxrt
+        from xdna1_llm.npu.linear import NpuLinear  # imports pyxrt
+        from xdna1_llm.npu.qlinear import NpuQLinear
 
         w = variants[first][0].w
-        variants[first + "-npu"] = (LFM3(w, NpuQLinear(kernel_dir=a.kernels, formats=w.types())), decode_logits)
-        pairs += [(first + "-npu", "bf16"), (first + "-npu", first)]
+        qlin = NpuQLinear(kernel_dir=a.kernels, formats=w.types())
+        m = LFM3(w, qlin, NpuLinear(qlin.npu, qlin.kdir))  # step() uses the GEMV, forward() the GEMM
+        variants[first + "-npu"] = (m, decode_logits)
+        variants[first + "-gemm"] = (m, prefill_logits)
+        pairs += [(v, ref) for v in (first + "-npu", first + "-gemm") for ref in ("bf16", first)]
     scores = {p: Score() for p in pairs}
 
     for n, c in enumerate(parts):
