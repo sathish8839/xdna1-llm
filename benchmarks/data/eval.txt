@@ -1,0 +1,78 @@
+How a Refrigerator Keeps Food Cold
+
+A refrigerator does not make cold; it moves heat. Inside the back wall runs a loop of pipe filled with a fluid called the refrigerant. A compressor squeezes the refrigerant vapor, which heats it up, and pushes it through the coils on the outside of the fridge. There the hot vapor gives its heat to the room and condenses into a liquid. The liquid then passes through a narrow valve into the coils inside the fridge, where the pressure suddenly drops. At low pressure the liquid boils even though it is cold, and boiling takes heat from whatever is around it: the air, the shelves, and the food. The vapor returns to the compressor and the cycle starts again. This is why the back or the bottom of a refrigerator feels warm, and why a fridge with its door left open makes the kitchen warmer, not cooler.
+
+The same idea runs air conditioners and heat pumps. A heat pump is simply a refrigerator that can be run in either direction: in summer it carries heat out of the house, and in winter it carries heat in from the outside air, even when that air is close to freezing. Because it moves heat instead of producing it, a heat pump can deliver three or four units of heat for every unit of electricity it uses.
+
+A Small Python Function
+
+The function below counts how often each word appears in a piece of text and returns the most common ones.
+
+def top_words(text: str, n: int = 5) -> list[tuple[str, int]]:
+    counts: dict[str, int] = {}
+    for raw in text.lower().split():
+        word = raw.strip(".,!?;:\"'()")
+        if not word:
+            continue
+        counts[word] = counts.get(word, 0) + 1
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return ranked[:n]
+
+
+if __name__ == "__main__":
+    sample = "the cat sat on the mat and the dog sat on the rug"
+    for word, count in top_words(sample, 3):
+        print(f"{word}: {count}")
+
+Running it prints "the: 4", then "on: 2" and "sat: 2". Ties are broken alphabetically, because the sort key is the negative count first and the word second.
+
+A Word Problem, Worked Step by Step
+
+Question: A bakery sells muffins for $3 each and cookies for $1.50 each. On Saturday it sold 48 muffins and twice as many cookies. Ingredients cost $0.80 per muffin and $0.35 per cookie. How much profit did the bakery make on these two items?
+
+Step 1: The number of cookies is 2 × 48 = 96.
+Step 2: Revenue from muffins is 48 × $3 = $144. Revenue from cookies is 96 × $1.50 = $144. Total revenue is $288.
+Step 3: Cost of muffins is 48 × $0.80 = $38.40. Cost of cookies is 96 × $0.35 = $33.60. Total cost is $72.00.
+Step 4: Profit is $288 − $72 = $216.
+
+Answer: The bakery made $216 in profit.
+
+A second check: each muffin earns $3 − $0.80 = $2.20 and each cookie earns $1.50 − $0.35 = $1.15. Then 48 × $2.20 = $105.60 and 96 × $1.15 = $110.40, which add up to $216.00, the same answer.
+
+Calling a Tool
+
+User: What's the weather like in Lisbon tomorrow? I want to know if I need an umbrella.
+
+Assistant: Let me look that up.
+{"name": "get_forecast", "arguments": {"city": "Lisbon", "country": "PT", "days": 1, "units": "metric"}}
+
+Tool result: {"city": "Lisbon", "date": "tomorrow", "high_c": 19, "low_c": 13, "precipitation_probability": 0.7, "summary": "Showers in the afternoon"}
+
+Assistant: Tomorrow in Lisbon expect a high of 19 °C and a low of 13 °C, with a 70% chance of showers in the afternoon. Yes, bring an umbrella, especially if you will be out after lunch.
+
+Instructions for Repotting a Houseplant
+
+1. Pick a new pot that is only one size larger than the old one, about two to five centimeters wider, with a drainage hole.
+2. Water the plant a day before, so the root ball holds together.
+3. Turn the old pot on its side, support the base of the stems with one hand, and slide the plant out. Do not pull it by the leaves.
+4. Loosen the outer roots gently with your fingers. Cut away any that are black, soft, or smell bad.
+5. Put a layer of fresh potting mix in the new pot, set the plant so the top of the root ball sits a little below the rim, and fill the gaps around it.
+6. Press the soil lightly, water until it drains from the bottom, and keep the plant out of strong sun for about a week while it settles.
+
+A Short Conversation About Learning
+
+"I keep starting programming tutorials and never finishing them," said Mira. "By the third chapter I've forgotten the first."
+
+"That happens when the tutorial is the goal," her friend replied. "Pick something small you actually want, like a script that renames your photos by date. Then learn exactly what you need to build it. You'll remember it because you used it."
+
+"And when I get stuck?"
+
+"Write down what you expected to happen and what happened instead. Half the time, writing it down is enough to see the mistake. The other half, you have a clear question to ask someone."
+
+Mira thought about it. "So the plan is: one small project, learn only what it needs, and keep notes when I'm stuck."
+
+"Exactly. Then do it again with a slightly bigger project."
+
+Summary of Key Facts
+
+Water boils at 100 °C at sea level, but at lower temperatures at high altitude, because the air pressure is lower. A kilometer is 1,000 meters, and a mile is about 1.609 kilometers. Light from the Sun takes a little over eight minutes to reach the Earth. The human heart beats roughly 60 to 100 times per minute at rest. A byte is eight bits, and a kilobyte is 1,024 bytes in the binary convention or 1,000 bytes in the decimal one.

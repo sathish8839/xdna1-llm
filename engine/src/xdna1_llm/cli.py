@@ -31,7 +31,9 @@ def main(argv=None):
     ap.add_argument("--server", default="http://127.0.0.1:18080")
     ap.add_argument("--llama-server", help="path to llama-server.exe to start for tokenization/reference")
     ap.add_argument("--kernels", help="directory with built xclbins (default: kernels/build or $XDNA1_LLM_KERNELS)")
-    ap.add_argument("--generate", type=int, metavar="N", help="decode N tokens greedily (Q4_K_M GGUF, NPU GEMVs)")
+    ap.add_argument(
+        "--generate", type=int, metavar="N", help="decode N tokens greedily (Q4_K_M or Q6_K GGUF, NPU GEMVs)"
+    )
     a = ap.parse_args(argv)
     if not a.gguf:
         ap.error("--gguf (or XDNA1_LLM_GGUF) is required")
@@ -40,6 +42,9 @@ def main(argv=None):
     if a.llama_server and not srv.healthy():
         print("starting llama-server (CPU only) ...", flush=True)
         srv.start(a.llama_server, a.gguf)
+    loaded = srv.model_path()
+    if loaded and os.path.normcase(os.path.abspath(loaded)) != os.path.normcase(os.path.abspath(a.gguf)):
+        print(f"note: the llama-server at {a.server} has {loaded} loaded; [llama.cpp] lines are from that model")
     ids = srv.tokenize(a.prompt)
     if a.generate:
         return generate(a, srv, ids)

@@ -200,8 +200,9 @@ class LFM3:
         self.cpu_ms += (time.perf_counter() - t0) * 1e3
         return h
 
-    def forward(self, ids, keep_hidden: bool = False):
-        """Prefill: returns (logits of the last position, list of per-layer hidden states if keep_hidden)."""
+    def forward(self, ids, keep_hidden: bool = False, all_logits: bool = False):
+        """Prefill: returns (logits of the last position, or of every position if all_logits, and the list of
+        per-layer hidden states if keep_hidden)."""
         h = self.embed(ids)
         hidden = []
         for i in range(self.n_layers):
@@ -212,7 +213,7 @@ class LFM3:
                 h = self._block(b, h, partial(self._attn, b, kind=kind))
             if keep_hidden:
                 hidden.append(h.copy())
-        return self.head(h[-1:])[0], hidden
+        return (self.head(h) if all_logits else self.head(h[-1:])[0]), hidden
 
     # ---- decode
     def new_state(self, max_len: int = 4096) -> State:

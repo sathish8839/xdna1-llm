@@ -55,12 +55,18 @@ cd /mnt/d/path/to/xdna1-llm
 MLIR_AIE=~/mlir-aie XRT_SDK_WIN=/mnt/c/Users/<you>/xrt_sdk/xrt_sdk/xrt ./kernels/build_kernels.sh kernels/build all
 ```
 
-Kernel sets: `engine` (the two GEMMs the model needs), `shapes` (benchmark kernels), `smoke`, `all`.
+Kernel sets: `engine` (the two prefill GEMMs), `qgemv` (the Q4_K / Q6_K decode GEMV, every shape of Q4_K_M and Q6_K
+models), `gemv` (bf16 decode GEMV), `shapes` (benchmark kernels), `bw`, `smoke`, `all`.
 
 ## 3. Model
 
-* A **BF16** LFM3 GGUF, for example `LFM3-1.7B-BF16.gguf` from
-  [LiquidAI/LFM3-1.7B-GGUF](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF). Q4_K_M support is in progress.
+From [LiquidAI/LFM3-1.7B-GGUF](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF):
+
+* **Q4_K_M** for decode (`--generate`): fastest (~14 tok/s), +6 % perplexity against BF16.
+* **Q6_K** for decode at near-BF16 accuracy (~11 tok/s). If the repository has no Q6_K file, make one from the
+  BF16 GGUF: `llama-quantize LFM3-1.7B-BF16.gguf LFM3-1.7B-Q6_K.gguf Q6_K`.
+* **BF16** for the bf16 prefill path (`--compare` without `--generate`) and as the reference of
+  `benchmarks/eval_quality.py` ([benchmarks §6](benchmarks.md#6-accuracy-what-quantization-costs)).
 * Until the native tokenizer lands, a llama.cpp `llama-server` with LFM3 support provides `/tokenize` and the
   reference output. Pass `--llama-server <path>` and the CLI starts it on the CPU.
 

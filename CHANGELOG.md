@@ -18,6 +18,11 @@ All notable changes to this project are documented here. The format follows
   streaming-bandwidth probe and benchmarks.
 - One GEMV xclbin per K now serves every N: the tile count travels with the activation, and
   `Kernel.add_program` switches instruction streams inside one context.
+- Q6_K "quality" model: an all-Q6_K GGUF decodes on the same NPU GEMV at ~11 tok/s with KLD 0.006 against
+  BF16 (Q4_K_M: ~14 tok/s, KLD 0.056). The CLI warns when a running llama-server holds a different model.
+- Accuracy harness (`benchmarks/eval_quality.py`, `xdna1_llm.quality`): perplexity, KL divergence and top-1
+  agreement against BF16. Q4_K_M costs +6 % perplexity on LFM3-1.7B, Q6_K ~0; the NPU engine adds KLD 0.0001.
+  The CPU reference also reads Q8_0.
 - Decode: q, k and v run as one weight, calls with several weight groups are queued together, and the host
   polls for completion instead of sleeping (11–12 → ~14 tok/s).
 - One NPU program for both quantized formats and every matrix shape: the format and sizes travel in a header

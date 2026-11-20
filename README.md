@@ -22,8 +22,8 @@ and aims for the Q4_K_M quant running entirely on the NPU, behind:
 - a small **native Windows chat app** with a thinking toggle and DuckDuckGo web search.
 
 > [!IMPORTANT]
-> **Pre-alpha.** Prompt processing (prefill) already runs on the NPU and matches llama.cpp. Token generation,
-> Q4_K_M, the server and the app are still being built. See the [roadmap](docs/roadmap.md).
+> **Pre-alpha.** Prefill and token generation (Q4_K_M or Q6_K) run on the NPU and match a CPU reference. The
+> tokenizer, the server and the app are still being built. See the [roadmap](docs/roadmap.md).
 
 ## Results so far
 
@@ -45,7 +45,8 @@ That is **1.6× faster and 2.5× less energy than the CPU, with the CPU nearly f
 | NPU kernels compiled with mlir-aie, running on the **Windows** NPU driver | ✅ |
 | Prefill with every linear layer on the NPU (bf16) | ✅ |
 | Native tokenizer, chat template, generation loop | ⏳ next |
-| **Q4_K_M** decode on the NPU (Q4_K / Q6_K GEMVs, KV cache): ~14 tok/s, being optimized | ✅ |
+| Decode on the NPU (KV cache): **Q4_K_M** ~14 tok/s, or **Q6_K** ~11 tok/s at near-BF16 accuracy | ✅ |
+| Accuracy harness: perplexity and KL divergence vs BF16; NPU engine adds ~0 on top of the GGUF | ✅ |
 | OpenAI-compatible server (streaming, tool calls) | ⏳ |
 | Windows app (chat, thinking toggle, web search) and installer | ⏳ |
 | Norms, conv, attention and SwiGLU fused on the NPU | ⏳ |
@@ -73,7 +74,7 @@ uv pip install -e ".[dev]"
 copy <xrt_sdk>\xrt\python\pyxrt.pyd .venv\Lib\site-packages\
 python -m pytest -rs                       # CPU tests, plus NPU tests when kernels are built
 xdna1-llm --gguf LFM3-1.7B-BF16.gguf --llama-server <llama-server.exe> --compare               # prefill
-xdna1-llm --gguf LFM3-1.7B-Q4_K_M.gguf --llama-server <llama-server.exe> --generate 24 --compare  # decode
+xdna1-llm --gguf LFM3-1.7B-Q4_K_M.gguf --llama-server <llama-server.exe> --generate 24 --compare  # decode (or Q6_K)
 ```
 
 ## How it works

@@ -172,6 +172,48 @@ layers rotate 32 of 64 pairs); `attn_gate` is a per-head sigmoid gate applied be
 * The NPU itself adds only ~7 W over idle (package minus cores).
 * Pitfall: CUDA builds of llama.cpp offload prompt batches to the GPU even with `-ngl 0`.
 
+## 6. Accuracy: what quantization costs
+
+`benchmarks/eval_quality.py` makes every variant predict each next token of a text
+([`benchmarks/data/eval.txt`](../benchmarks/data/eval.txt): prose, Python, a worked word problem, a tool call,
+instructions, dialogue; 1,440 tokens in chunks of 256, each starting from an empty context) and compares it
+with the original BF16 weights run in fp32 on the CPU. These are the measures llama.cpp uses to judge
+quantizations:
+
+* **perplexity**: how surprised the model is by the real text (lower is better);
+* **KL divergence (KLD)**: how far the variant's probabilities over the whole vocabulary are from BF16's
+  (0 = identical), mean and 99th percentile;
+* **same top-1**: how often both rank the same token first.
+
+| Variant | file | perplexity | mean KLD vs BF16 | KLD p99 | same top-1 as BF16 |
+|---|---|---|---|---|---|
+| BF16 (reference) | 3.47 GB | 7.177 | — | — | — |
+| Q8_0 | 1.85 GB | 7.179 | 0.0005 | 0.004 | 99.0 % |
+| Q6_K | 1.43 GB | 7.161 | 0.0057 | 0.052 | 95.8 % |
+| **Q4_K_M** (what decode runs today) | 1.10 GB | 7.606 (+6.0 %) | 0.056 | 0.47 | 88.6 % |
+| Q4_K_M on our NPU engine | | 7.607 | 0.057 | 0.47 | 88.5 % |
+| Q6_K on our NPU engine | | 7.158 | 0.0061 | 0.057 | 95.9 % |
+| *NPU engine vs the same Q4_K_M on the CPU* | | | *0.0001* | *0.001* | *99.4 %* |
+| *NPU engine vs the same Q6_K on the CPU* | | | *0.00005* | *0.0004* | *99.8 %* |
+
+* **The engine adds nothing measurable.** Against the same Q4_K_M weights in fp32 the NPU path's KLD is 0.0001,
+  500× below what the format itself costs; the 0.6 % of tokens where the top-1 differs are near-ties.
+* **Q4_K_M has a real cost on this 1.7B model:** perplexity +6 %, and about one token in nine gets a different
+  first choice than BF16 (often a near-synonym, but it shows up first in arithmetic, exact facts and formats).
+  Small models lose more to 4-bit than 7B+ ones.
+* **Q6_K is close to lossless** (KLD 10× lower, perplexity within noise of BF16) for 30 % more bytes, and runs
+  on the same decode GEMV and context (four more instruction streams: 2048, 3072, 6144 and 15360 × 2048).
+
+| Decode on the NPU (32 tokens, two runs each) | file | generation | linears per token | logits vs BF16 (KLD) |
+|---|---|---|---|---|
+| Q4_K_M ("fast") | 1.10 GB | 13.5–13.7 tok/s | 68 ms, 102 calls | 0.057 |
+| Q6_K ("quality") | 1.43 GB | 10.6–10.9 tok/s | 86–88 ms, 97 calls | 0.006 |
+
+  Q6_K needs fewer calls (q, k and v are one format, so one call) but its kernel streams ~19–28 G weights/s
+  against Q4_K's ~27–44, so a faster 6-bit unpack speeds up both models.
+* 1,440 tokens is small: differences under ~1 % perplexity are noise. Q6_K / Q8_0 were made locally from the
+  BF16 GGUF with `llama-quantize` (no imatrix).
+
 ## Related work
 
 * [amd/IRON](https://github.com/amd/IRON): operator library and Llama 3.2 1B on NPU1 (Linux).

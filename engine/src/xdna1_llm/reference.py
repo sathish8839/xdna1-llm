@@ -62,6 +62,11 @@ class LlamaServer:
         except Exception:  # noqa: BLE001
             return False
 
+    def model_path(self) -> str | None:
+        """The GGUF the running server has loaded (a server left over from another run may hold another one)."""
+        with urllib.request.urlopen(self.url + "/props", timeout=5) as r:
+            return json.loads(r.read()).get("model_path")
+
     def post(self, path: str, body: dict) -> dict:
         req = urllib.request.Request(
             self.url + path, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}

@@ -24,7 +24,7 @@ the remaining ops is how we get to "entirely".
 
 ## Hard constraints
 
-These come from measurements in [benchmarks.md](benchmarks.md):
+These come from measurements in [benchmarks.md](benchmarks.md) (the last one is a rule we hold ourselves to):
 
 1. **5 hardware contexts**, and **~1.45 ms** to switch between them. Every design keeps a forward pass inside
    1–3 contexts.
@@ -35,6 +35,9 @@ These come from measurements in [benchmarks.md](benchmarks.md):
 5. **Decode weight streaming:** ~9 GB/s with the GEMM design, 14–28 GB/s with the 8-lane bf16 GEMV, and up to
    35 G weights/s with the 4-bit GEMV ([benchmarks](benchmarks.md#3b-decode-gemv-m--1)), which puts 4-bit decode
    at an estimated ~16 tok/s before fusing.
+6. **No silent accuracy loss.** The NPU path must match the CPU run of the same GGUF (KLD ≲ 1e-3 on
+   `benchmarks/eval_quality.py`) before a speed change lands; what a quantization format costs is measured
+   against BF16 and published ([benchmarks §6](benchmarks.md#6-accuracy-what-quantization-costs)).
 
 ## M2: tokenizer and generation
 
@@ -74,6 +77,9 @@ GGUF Q4_K_M mixes **Q4_K** (most tensors) and **Q6_K** (for LFM3-1.7B: `token_em
 3. **Optional W4A8:** AIE2's int4 × int8 MAC modes with per-token int8 activations. Faster, slightly different
    numerics; benchmark against (2).
 4. Q6_K: same structure with a 6-bit unpack. Done for decode (`kernels/designs/qgemv.cc`).
+5. **Quality option:** done. Q4_K_M costs +6 % perplexity and KLD 0.056 against BF16 on LFM3-1.7B, Q6_K
+   KLD 0.006 ([benchmarks §6](benchmarks.md#6-accuracy-what-quantization-costs)). An all-Q6_K GGUF runs on the
+   same GEMV at ~11 tok/s ("quality") next to Q4_K_M at ~14 tok/s ("fast"); the app should offer both.
 
 ## M5–M6: server, app, installer
 

@@ -97,7 +97,8 @@ if [[ "$SET" == qgemv || "$SET" == all ]]; then
   for shape in 512x2048 2048x2048 2560x2048 3072x2048 6144x2048 15360x2048 2048x7680; do  # Q4_K tensors
     design "q4_$shape" qgemv.py -Q 4 -N "${shape%x*}" -K "${shape#*x}"
   done
-  for shape in 512x2048 128000x2048 2048x7680; do  # Q6_K: attn_v, LM head, ffn_down
+  # Q6_K: attn_v, LM head and ffn_down in Q4_K_M; every tensor of an all-Q6_K model ("quality")
+  for shape in 512x2048 2048x2048 3072x2048 6144x2048 15360x2048 128000x2048 2048x7680; do
     design "q6_$shape" qgemv.py -Q 6 -N "${shape%x*}" -K "${shape#*x}"
   done
 fi

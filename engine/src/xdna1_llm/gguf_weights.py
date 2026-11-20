@@ -75,7 +75,11 @@ def dequantize(kind: str, data: np.ndarray) -> np.ndarray:
         return q4k.dequantize(data)
     if kind == "Q6_K":
         return q6k.dequantize(data)
-    raise NotImplementedError(f"tensor type {kind} not supported (BF16, F32, Q4_K, Q6_K)")
+    if kind == "Q8_0":  # blocks of 32: fp16 scale, 32 int8 (CPU reference only, no NPU kernel)
+        b = data.reshape(data.shape[0], -1, 34)
+        d = b[..., :2].copy().view(np.float16).astype(np.float32)
+        return (d * b[..., 2:].view(np.int8)).reshape(data.shape[0], -1)
+    raise NotImplementedError(f"tensor type {kind} not supported (BF16, F32, Q4_K, Q6_K, Q8_0)")
 
 
 def as_parts(w) -> list[tuple[str, np.ndarray]]:
