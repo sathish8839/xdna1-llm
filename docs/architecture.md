@@ -26,8 +26,8 @@ All of these were measured on the Windows driver; see [benchmarks.md](benchmarks
 3. **Each dispatch costs ~0.1–0.2 ms.** All chunks of a projection are queued first and then awaited.
 4. **64 KB of data memory per compute tile.** An fp32 64×64 output tile plus double-buffered inputs does
    not fit, so the kernels use 64×64×32 tiles.
-5. **Decode is bandwidth-bound.** The GEMM design streamed weights at ~9 GB/s, which is why 4-bit weights and
-   a dedicated GEMV kernel are the next big steps.
+5. **Decode is bandwidth-bound.** The prefill GEMM streams weights at ~9 GB/s; the dedicated 8-lane GEMV
+   reaches 17–28 GB/s. 4-bit weights are the next lever.
 
 ## Why the model code is plain numpy
 

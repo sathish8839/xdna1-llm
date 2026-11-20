@@ -3,7 +3,8 @@
 #
 #   MLIR_AIE=~/mlir-aie XRT_SDK_WIN=/mnt/c/.../xrt_sdk/xrt ./kernels/build_kernels.sh [out_dir] [set]
 #
-# sets: engine (default: the two chunk GEMMs the engine needs), shapes (per-shape benchmark kernels), smoke, all
+# sets: engine (default: the two chunk GEMMs the engine needs), gemv (decode GEMVs), bw (streaming probes),
+#       shapes (per-shape GEMM benchmark kernels), smoke, all
 # Requires: an mlir-aie checkout with its ironenv (utils/env_install.sh) and xclbinutil on PATH
 # (on WSL use kernels/xclbinutil-wsl, which this script puts on PATH automatically).
 set -uo pipefail
@@ -73,4 +74,25 @@ if [[ "$SET" == smoke || "$SET" == all ]]; then
       && cp "$VSM/build/insts_8192.bin" "$OUT/smoke_vector_scalar_mul.bin" && rm -f "$OUT/smoke.log" \
       && echo "built smoke_vector_scalar_mul" || echo "FAIL  smoke (see $OUT/smoke.log)"
   fi
+fi
+
+design() {  # out_name script.py [design args...]: an IRON design from kernels/designs
+  local name=$1 py=$2; shift 2
+  [[ -f "$OUT/$name.xclbin" ]] && { echo "skip  $name"; return; }
+  if (cd "$OUT" && python3 "$HERE/designs/$py" --dev npu "$@" --xclbin-path="$OUT/$name.xclbin"         --insts-path="$OUT/$name.bin" > "$OUT/$name.log" 2>&1 < /dev/null); then
+    rm -rf "$OUT/$name.log" "$OUT/$name.prj"; echo "built $name"
+  else
+    echo "FAIL  $name (see $OUT/$name.log)"
+  fi
+}
+
+if [[ "$SET" == gemv || "$SET" == all ]]; then
+  for shape in 1024x2048 2048x2048 6144x2048 15360x2048 2048x7680; do  # LFM3-1.7B projections (N x K)
+    design "gemv_$shape" gemv.py -N "${shape%x*}" -K "${shape#*x}"
+  done
+fi
+if [[ "$SET" == bw || "$SET" == all ]]; then
+  for lanes in 1 2 4 8; do
+    design "bw_l${lanes}_mb16" stream_bw.py --lanes "$lanes" --tile-kb 16 --total-mb 16
+  done
 fi

@@ -35,9 +35,35 @@ Everything below was measured on a Ryzen 7 250 (XDNA1, "NPU Phoenix"), Windows 1
 | conv in_proj, int8 | — | — | 2.26 ms | 5.6 GB/s |
 
 * Prefill GEMMs reach 1.3–1.9 TFLOP/s, close to the best published XDNA1 numbers.
-* Decode is limited to ~9 GB/s of weight streaming with this kernel. int8 barely helps (2.26 vs 2.60 ms), so the
-  limit is the DMA/tiling pattern, not bytes. A dedicated M=1 GEMV design is needed (see [roadmap](roadmap.md)).
+* The GEMM design streams decode weights at only ~9 GB/s, and int8 barely helps (2.26 vs 2.60 ms), so the limit is
+  its DMA/tiling pattern, not bytes. The dedicated GEMV in section 3b fixes this.
 * bf16 output on K = 7680 shows ~3 % max relative error; the engine uses fp32 output.
+
+## 3b. Decode GEMV (M = 1)
+
+`kernels/designs/stream_bw.py` streams host memory into cores with no compute. `kernels/designs/gemv.py` is a bf16
+GEMV with fp32 output: 8 lanes (two shim channels per column, cores in rows 2–3), each lane owning N/8 rows, and
+the activation sent on the same lane as one tile ahead of the weights. Medians of 50 runs, including dispatch.
+
+| Streaming only (16 MB) | 1 lane | 2 lanes | 4 lanes | 8 lanes |
+|---|---|---|---|---|
+| GB/s | 6.4 | 11.5 | 19.3 | **23.5** |
+
+| GEMV shape (N×K) | Weights | Time | Weight stream | Max rel. error vs numpy |
+|---|---|---|---|---|
+| k+v 1024×2048 | 4 MB | 0.33 ms | 12.8 GB/s | 1.7e-7 |
+| q / o / conv-out 2048×2048 | 8 MB | 0.49 ms | 17.3 GB/s | 2.0e-7 |
+| conv in_proj 6144×2048 | 24 MB | 1.10 ms | 22.9 GB/s | 1.9e-7 |
+| FFN gate+up 15360×2048 | 60 MB | 2.24 ms | **28.1 GB/s** | 1.8e-7 |
+| FFN down 2048×7680 | 30 MB | 1.42 ms | 22.1 GB/s | 2.2e-7 |
+
+* 3× the GEMM design's decode bandwidth, with the compute (16-lane bf16 MACs, 4 accumulators) keeping up.
+* Each call carries ~0.15–0.2 ms of fixed cost, which is why small shapes reach less. Fusing calls per layer
+  removes most of it.
+* bf16 LFM3-1.7B decode with these kernels, one call per projection: about 120 ms of projections plus ~19 ms of
+  LM head per token, so ~7 tok/s. Q4_K_M moves ~3× fewer bytes, so the same bandwidth would allow ~20 tok/s if
+  the 4-bit unpacking keeps up (not yet measured).
+* Every shape is its own xclbin here. The engine needs one design sized at run time to stay within 5 contexts.
 
 ## 4. LFM3-1.7B prefill with linears on the NPU
 
