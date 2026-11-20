@@ -51,6 +51,11 @@ class GGUFWeights:
             f"{name}: tensor type {kind} not supported yet (BF16/F32 only; Q4_K support is on the roadmap)"
         )
 
+    def quant(self, name: str) -> tuple[str, np.ndarray]:
+        """A quantized tensor as (type name, uint8 (rows, bytes per row)), still in GGUF block format."""
+        t = self.tensors[name]
+        return t.tensor_type.name, np.asarray(t.data).view(np.uint8).reshape(int(t.shape[-1]), -1)
+
     def f32(self, name: str) -> np.ndarray:
         a = self.raw(name)
         return from_bf16(a) if a.dtype == np.uint16 else a

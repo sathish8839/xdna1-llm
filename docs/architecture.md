@@ -27,7 +27,7 @@ All of these were measured on the Windows driver; see [benchmarks.md](benchmarks
 4. **64 KB of data memory per compute tile.** An fp32 64×64 output tile plus double-buffered inputs does
    not fit, so the kernels use 64×64×32 tiles.
 5. **Decode is bandwidth-bound.** The prefill GEMM streams weights at ~9 GB/s; the dedicated 8-lane GEMV
-   reaches 17–28 GB/s. 4-bit weights are the next lever.
+   reaches 17–28 GB/s, and the 4-bit Q4_K GEMV 15–44 G weights/s.
 
 ## Why the model code is plain numpy
 

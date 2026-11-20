@@ -93,8 +93,8 @@ if [[ "$SET" == gemv || "$SET" == all ]]; then
   done
 fi
 if [[ "$SET" == q4gemv || "$SET" == all ]]; then
-  for shape in 1024x2048 2048x2048 6144x2048 15360x2048; do  # one context per K: the largest N's xclbin plus
-    design "q4_$shape" q4gemv.py -N "${shape%x*}" -K "${shape#*x}"  # every N's instruction stream
+  for shape in 512x2048 2048x2048 6144x2048 7680x2048 15360x2048 128000x2048 2048x7680; do  # one context per K:
+    design "q4_$shape" q4gemv.py -N "${shape%x*}" -K "${shape#*x}"  # largest N's xclbin + every N's insts
   done
 fi
 if [[ "$SET" == bw || "$SET" == all ]]; then

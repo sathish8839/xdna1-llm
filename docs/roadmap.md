@@ -47,22 +47,25 @@ These come from measurements in [benchmarks.md](benchmarks.md):
 
 * **GEMV design** for M=1: done (`kernels/designs/gemv.py`), 8 lanes, 14–28 GB/s, exact against numpy. One xclbin
   per K serves every N through per-N instruction streams, so all projections of a K share one context.
-* **4-bit GEMV** (`kernels/designs/q4gemv.py`): working for K = 2048 at up to 35 G weights/s. Remaining: K split
-  across tiles (FFN down, LM head), repacking real Q4_K / Q6_K tensors from GGUF, fewer dispatches.
+* **4-bit GEMV** (`kernels/designs/q4gemv.py`): reads Q4_K repacked at load (`xdna1_llm/q4k.py`), every LFM3
+  Q4_K shape including FFN down (K = 7680) and LM-head-sized N, 15–44 G weights/s, ~1e-4 from the GGUF
+  dequantization. Remaining: Q6_K tensors, fewer dispatches.
 * State in NPU-visible buffers across calls: the KV cache for the 11 attention layers (bf16, 4 KV heads × 128)
   and a 6-token rolling buffer for each of the 13 short-conv layers.
 
 ## M4: Q4_K_M on the NPU
 
-GGUF Q4_K_M mixes **Q4_K** (most tensors) and **Q6_K** (for example attn_v and half of ffn_down).
+GGUF Q4_K_M mixes **Q4_K** (most tensors) and **Q6_K** (for LFM3-1.7B: `token_embd`, which is also the LM head,
+11 of 24 `ffn_down` and 5 `attn_v`).
 
 | Format | Super-block | Layout | bits/weight |
 |---|---|---|---|
 | Q4_K | 256 weights = 8 sub-blocks × 32 | fp16 `d`, fp16 `dmin`, 12 B of 6-bit scales/mins, 128 B of 4-bit quants | 4.5 |
 | Q6_K | 256 weights = 16 sub-blocks × 16 | 128 B low 4 bits, 64 B high 2 bits, 16 int8 scales, fp16 `d` | 6.56 |
 
-1. **Repack at load** (one time): reorder super-blocks into the tile order the kernels consume, and expand
-   scales/mins per 32-weight group (`w = d·sc·q − dmin·m`). Dequantization is bit-exact against llama.cpp.
+1. **Repack at load** (one time): reorder super-blocks into the tile order the kernels consume and unpack the
+   6-bit scales/mins (`w = d·sc·q − dmin·m`). Done for Q4_K (`xdna1_llm/q4k.py`), lossless; tested against
+   `gguf.quants`.
 2. **W4A16 kernel:** unpack nibbles in the vector unit, apply the group scale and min, then bf16 `mmul`.
 3. **Optional W4A8:** AIE2's int4 × int8 MAC modes with per-token int8 activations. Faster, slightly different
    numerics; benchmark against (2).

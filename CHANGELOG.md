@@ -18,4 +18,5 @@ All notable changes to this project are documented here. The format follows
   streaming-bandwidth probe and benchmarks.
 - One GEMV xclbin per K now serves every N: the tile count travels with the activation, and
   `Kernel.add_program` switches instruction streams inside one context.
-- 4-bit GEMV (Q4_K-style scales and mins): up to 35 G weights/s for K = 2048, ~2e-5 from an fp32 reference.
+- 4-bit GEMV on GGUF Q4_K weights, repacked losslessly at load (`xdna1_llm/q4k.py`): long rows split across
+  tiles, outputs streamed per 16 rows, 15–44 G weights/s on LFM3 shapes, ~1e-4 from the GGUF dequantization.
