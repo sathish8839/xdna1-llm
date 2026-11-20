@@ -113,18 +113,23 @@ is fed one token at a time for now.
 
 | | |
 |---|---|
-| | four contexts (one per format and K) | **one context** |
-|---|---|---|
-| Generation | 8.5 tok/s | **11.0–11.9 tok/s** |
-| Per token: linear layers | 107 ms in 113 calls, 59 context switches | 77–81 ms in 113 calls, none |
-| Per token: CPU ops | 8.4 ms | 7.7–9.5 ms |
-| Logits vs. an fp32 CPU reference on the same weights | cosine ≥ 0.99993 | cosine ≥ 0.99989, same top-1 at every step |
+| | four contexts (one per format and K) | one context | **+ q/k/v fused, polled completion** |
+|---|---|---|---|
+| Generation | 8.5 tok/s | 11.0–11.9 tok/s | **13.8–13.9 tok/s** |
+| Per token: linear layers | 107 ms, 113 calls, 59 context switches | 77–81 ms, 113 calls | 67 ms, 102 calls |
+| Per token: CPU ops | 8.4 ms | 7.7–9.5 ms | 4.7–5.1 ms |
+| Logits vs. fp32 CPU reference | cosine ≥ 0.99993 | cosine ≥ 0.99989 | cosine ≥ 0.99989, same top-1 every step |
 
 * With four contexts the layers alternated between Q4_K/Q6_K and K = 2048/7680 GEMVs, costing ~45 ms per token
   in context switches; the merged kernel removes them.
-* The kernels add up to ~69 ms per token; the remaining ~10 ms of linear time is host work per call (writing x
-  and the header, syncing buffers). Next: fewer calls per layer (q/k/v and the whole FFN in one dispatch), then a
-  batched prompt path.
+* Most of a small call's fixed cost is the host round trip, not NPU work: one 512-row GEMV takes 0.245 ms with
+  `run.wait()`, 0.193 ms when the host polls the run's state instead, and 0.086 ms each when ten are queued
+  back to back. So the engine polls for completion, stacks q, k and v into one weight (one call, or a Q4_K and
+  a Q6_K call queued together where `attn_v` is Q6_K), and gives every weight its own x buffer so queued calls
+  do not overwrite each other.
+* What is left is mostly the kernels themselves (~60 ms per token, a third of it in Q6_K: LM head and half of
+  FFN down). The other calls depend on CPU work between them (norms, short conv, attention, SwiGLU), so fusing
+  further means moving that work onto the NPU.
 * llama.cpp's greedy output for the same prompt diverges after a few tokens where two candidates are close.
   At that step both the fp32 reference and llama.cpp's own prompt evaluation rank our token first; llama.cpp's
   CPU decode path rounds activations to 8 bits, so its token-by-token output differs slightly from its own

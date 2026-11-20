@@ -94,7 +94,7 @@ if [[ "$SET" == gemv || "$SET" == all ]]; then
 fi
 if [[ "$SET" == qgemv || "$SET" == all ]]; then
   # every build has the same cores (one context runs them all); each matrix shape needs its instruction stream
-  for shape in 512x2048 1024x2048 2048x2048 6144x2048 15360x2048 2048x7680; do  # Q4_K tensors
+  for shape in 512x2048 2048x2048 2560x2048 3072x2048 6144x2048 15360x2048 2048x7680; do  # Q4_K tensors
     design "q4_$shape" qgemv.py -Q 4 -N "${shape%x*}" -K "${shape#*x}"
   done
   for shape in 512x2048 128000x2048 2048x7680; do  # Q6_K: attn_v, LM head, ffn_down

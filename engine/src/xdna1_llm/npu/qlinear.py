@@ -17,7 +17,7 @@ import numpy as np
 from .. import q4k, q6k
 from ..bf16 import to_bf16
 from ..gguf_weights import as_parts
-from .device import FROM_DEV, TO_DEV, Npu, mapped
+from .device import FROM_DEV, TO_DEV, Npu, finish, mapped
 
 FORMATS = {"Q4_K": (4, q4k), "Q6_K": (6, q6k)}
 
@@ -35,8 +35,6 @@ class NpuQLinear:
             raise FileNotFoundError(f"no quantized GEMV in {self.kdir} (kernels/build_kernels.sh <out> qgemv)")
         path = os.path.join(self.kdir, built[0])  # every build has the same cores; any one makes the context
         self.kern = self.npu.load("qgemv", path + ".xclbin", path + ".bin")
-        self.bo_x = self.npu.bo(2 * q4k.TILE_BYTES, self.kern.group(1))
-        self.x = mapped(self.bo_x, np.uint8)
         self.mats: dict[str, list[dict]] = {}
         self.npu_ms, self.calls, self.repack_s = 0.0, 0, 0.0
 
@@ -69,24 +67,31 @@ class NpuQLinear:
             bo_w.write(tiles.tobytes(), 0)
             bo_w.sync(TO_DEV)
             bo_y = self.npu.bo(N * 4, self.kern.group(2))
-            mats.append(dict(fmt=fmt, prog=prog, N=N, K=K, bo_w=bo_w, bo_y=bo_y, y=mapped(bo_y, np.float32)))
+            bo_x = self.npu.bo(2 * q4k.TILE_BYTES, self.kern.group(1))  # own x, so groups can be queued together
+            x, y = mapped(bo_x, np.uint8), mapped(bo_y, np.float32)
+            mats.append(dict(fmt=fmt, prog=prog, N=N, K=K, bo_w=bo_w, bo_x=bo_x, x=x, bo_y=bo_y, y=y))
         self.mats[name] = mats
 
     def __call__(self, name: str, x: np.ndarray) -> np.ndarray:
-        """x (T, K) float32 -> (T, N) float32, one GEMV per row and weight group."""
+        """x (T, K) float32 -> (T, N) float32. A weight with several groups (for example Q4_K q+k and a Q6_K v)
+        queues all its GEMVs before waiting, so their dispatch latencies overlap."""
         x = np.atleast_2d(x)
         t0 = time.perf_counter()
-        out = np.empty((x.shape[0], sum(m["N"] for m in self.mats[name])), np.float32)
+        mats = self.mats[name]
+        out = np.empty((x.shape[0], sum(m["N"] for m in mats)), np.float32)
         for t in range(x.shape[0]):
-            col = 0
             xbits = to_bf16(x[t])
-            for m in self.mats[name]:
-                self.x[:] = q4k.x_input(xbits, m["fmt"], m["N"], m["K"])
-                self.bo_x.sync(TO_DEV)
-                self.kern.run(m["bo_w"], self.bo_x, m["bo_y"], program=m["prog"])
+            runs = []
+            for m in mats:
+                m["x"][:] = q4k.x_input(xbits, m["fmt"], m["N"], m["K"])
+                m["bo_x"].sync(TO_DEV)
+                runs.append(self.kern.start(m["bo_w"], m["bo_x"], m["bo_y"], program=m["prog"]))
+            col = 0
+            for m, r in zip(mats, runs, strict=True):
+                finish(r, m["prog"])
                 m["bo_y"].sync(FROM_DEV)
                 out[t, col : col + m["N"]] = m["y"]
                 col += m["N"]
-                self.calls += 1
+            self.calls += len(mats)
         self.npu_ms += (time.perf_counter() - t0) * 1e3
         return out

@@ -95,8 +95,8 @@ class LFM3:
                 lin.register(b + "out_proj", w.tensor(b + "shortconv.out_proj.weight"))
                 self.p[b + "conv"] = w.f32(b + "shortconv.conv.weight")  # (D, 7), k=6 is the newest token
             else:
-                lin.register(b + "q", w.tensor(b + "attn_q.weight"))
-                lin.register(b + "kv", [w.tensor(b + "attn_k.weight"), w.tensor(b + "attn_v.weight")])
+                qkv = [w.tensor(b + f"attn_{n}.weight") for n in "qkv"]
+                lin.register(b + "qkv", qkv)  # one weight with stacked rows: q (nh*hd), k, v (nkv*hd each)
                 lin.register(b + "o", w.tensor(b + "attn_output.weight"))
                 self.p[b + "gate"] = w.f32(b + "attn_gate.weight")  # (H, D)
                 self.p[b + "q_norm"] = w.f32(b + "attn_q_norm.weight")
@@ -157,12 +157,11 @@ class LFM3:
     def _attn(self, b, u, kind):
         T, nh, hd = u.shape[0], self.nh, self.hd
         nkv = self.kv_heads[int(b.split(".")[1])]
-        q = self.lin(b + "q", u).reshape(T, nh, hd)
-        kv = self.lin(b + "kv", u)
+        qkv = self.lin(b + "qkv", u)
         t0 = time.perf_counter()
-        k = rms(kv[:, : nkv * hd].reshape(T, nkv, hd), self.p[b + "k_norm"])
-        v = kv[:, nkv * hd :].reshape(T, nkv, hd)
-        q = rms(q, self.p[b + "q_norm"])
+        q = rms(qkv[:, : nh * hd].reshape(T, nh, hd), self.p[b + "q_norm"])
+        k = rms(qkv[:, nh * hd : (nh + nkv) * hd].reshape(T, nkv, hd), self.p[b + "k_norm"])
+        v = qkv[:, (nh + nkv) * hd :].reshape(T, nkv, hd)
         cos, sin = self.rope(kind, T)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         rep = nh // nkv
@@ -232,14 +231,13 @@ class LFM3:
 
     def _attn_step(self, b, i, u, kind, st):
         nh, hd, nkv, pos = self.nh, self.hd, self.kv_heads[i], st.pos
-        q = self.lin(b + "q", u).reshape(1, nh, hd)
-        kv = self.lin(b + "kv", u)[0]
+        qkv = self.lin(b + "qkv", u)[0]
         t0 = time.perf_counter()
-        k = rms(kv[: nkv * hd].reshape(1, nkv, hd), self.p[b + "k_norm"])
-        q = rms(q, self.p[b + "q_norm"])
+        q = rms(qkv[: nh * hd].reshape(1, nh, hd), self.p[b + "q_norm"])
+        k = rms(qkv[nh * hd : (nh + nkv) * hd].reshape(1, nkv, hd), self.p[b + "k_norm"])
         cos, sin = self.rope(kind, 1, pos)
         st.k[i][pos] = apply_rope(k, cos, sin)[0]
-        st.v[i][pos] = kv[nkv * hd :].reshape(nkv, hd)
+        st.v[i][pos] = qkv[(nh + nkv) * hd :].reshape(nkv, hd)
         q = apply_rope(q, cos, sin)[0].reshape(nkv, nh // nkv, hd)  # GQA: query heads grouped by kv head
         lo = max(0, pos - self.window + 1) if kind == "swa" else 0
         K, V = st.k[i][lo : pos + 1], st.v[i][lo : pos + 1]  # (L, nkv, hd)

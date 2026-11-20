@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 import numpy as np
 
@@ -81,9 +82,27 @@ class Kernel:
         return self.kernel(3, bo_instr, n, *bos)
 
     def run(self, *bos, program: str = "default"):
-        st = self.start(*bos, program=program).wait()
-        if st != COMPLETED:
-            raise RuntimeError(f"{self.tag}: {st}")
+        finish(self.start(*bos, program=program), self.tag)
+
+
+_PENDING = {
+    getattr(xrt.ert_cmd_state, f"ERT_CMD_STATE_{s}")
+    for s in ("NEW", "QUEUED", "RUNNING", "SUBMITTED")
+    if hasattr(xrt.ert_cmd_state, f"ERT_CMD_STATE_{s}")
+}
+
+
+def finish(run, what: str = "kernel", spin_s: float = 0.05):
+    """Wait for a started run. Polls first: for sub-millisecond decode calls that is ~0.05 ms faster than
+    run.wait(), which sleeps until the driver wakes it. Falls back to wait() after spin_s."""
+    t_end = time.perf_counter() + spin_s
+    st = run.state()
+    while st in _PENDING and time.perf_counter() < t_end:
+        st = run.state()
+    if st in _PENDING:
+        st = run.wait()
+    if st != COMPLETED:
+        raise RuntimeError(f"{what}: {st}")
 
 
 def mapped(bo, dtype, shape=None) -> np.ndarray:
