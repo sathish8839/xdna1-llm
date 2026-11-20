@@ -18,6 +18,7 @@ import numpy as np
 
 from . import chat
 from .cpu_linear import CpuLinear
+from .engine import gemm_backend
 from .gguf_weights import GGUFWeights
 from .models.lfm3 import LFM3
 from .reference import LlamaServer
@@ -138,16 +139,6 @@ def sampler(a, w) -> Sampler | None:
     if not a.sample and all(v is None for k, v in opts.items() if k != "seed"):
         return None
     return Sampler.from_gguf(w, **opts)
-
-
-def gemm_backend(npu, kdir):
-    """The bf16 GEMM for batched prompts, sharing the device; None (with a note) if its kernels are not built."""
-    from .npu.linear import SUPPORTED_K, NpuLinear
-
-    if not all(os.path.exists(os.path.join(kdir, f"gemm_256x{k}x1024_bf16_f32.xclbin")) for k in SUPPORTED_K):
-        print(f"note: no bf16 GEMM kernels in {kdir} (kernels/build_kernels.sh <out> engine); prompt runs on the GEMV")
-        return None
-    return NpuLinear(npu, kdir)
 
 
 def generate(a, w, tok, srv, ids):

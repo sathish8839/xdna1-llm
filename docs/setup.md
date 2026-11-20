@@ -83,6 +83,25 @@ python benchmarks\power_bench.py --gguf <gguf> --llama-server <llama-server.exe>
 
 `bench_shapes.py` needs the `shapes` kernel set.
 
+### The OpenAI-compatible server
+
+```powershell
+xdna1-llm-server --gguf <gguf> [--port 8080] [--thinking] [--ctx 4096]
+```
+
+Point any OpenAI client at `http://127.0.0.1:8080/v1` (any API key works). It serves `POST /v1/chat/completions`
+(streaming, `tools`, `stop`, `max_tokens`, `temperature`, `top_p`, `seed`, plus `top_k`, `min_p` and
+`repeat_penalty`), `GET /v1/models` and `GET /health`. Reasoning comes back in `reasoning_content`; thinking is off
+unless `--thinking` is given or a request sends `chat_template_kwargs: {"enable_thinking": true}` or a
+`reasoning_effort` other than `none`. The NPU runs one turn at a time, so concurrent requests queue. The server
+binds to localhost; pass `--host 0.0.0.0` only on a network you trust (there is no authentication).
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="none")
+r = client.chat.completions.create(model="LFM3-1.7B-Q4_K_M", messages=[{"role": "user", "content": "Hi"}])
+```
+
 Environment variables:
 
 * `XDNA1_LLM_KERNELS`: the kernel directory. By default the engine uses `kernels/build` in a source checkout,

@@ -7,6 +7,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- OpenAI-compatible server (`xdna1-llm-server`, standard library only): `/v1/chat/completions` with SSE streaming,
+  tool calls in the OpenAI shape, `reasoning_content`, stop strings and sampling options; `/v1/models` and
+  `/health`. Binds to localhost and runs one turn at a time. Checked with the OpenAI Python SDK (Q4_K_M: first
+  token 1.2 s, 14.3 tok/s). The turn logic is in `xdna1_llm.engine`.
 - Batched prompt: `LFM3.forward` prefills in chunks into the decode state, and `--generate` runs prompt chunks of
   32–256 tokens on the bf16 GEMM with a bf16 copy of the weights (689 tokens: 38.6 → 5.1 s; +2.9 GB RAM, +25 s
   load; KLD 0.00005 against the CPU). `--no-gemm-prompt` keeps the old token-by-token path.

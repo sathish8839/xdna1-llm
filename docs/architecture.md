@@ -15,6 +15,8 @@ engine/src/xdna1_llm/
   chat.py            LFM3's chat template (thinking, tools) in Python
   sampling.py        next-token choice: greedy, or temperature / top-k / top-p / min-p / repetition penalty
   reference.py       llama-server client: the optional ground truth for tests and benchmarks
+  engine.py          one chat turn: template, prompt, sampling; splits reasoning, content and tool calls
+  server.py          OpenAI-compatible HTTP server (standard library), one turn at a time on the NPU
   cli.py             run a prompt or chat message on the NPU and/or CPU, optionally against llama.cpp
 kernels/build_kernels.sh   builds the xclbins from mlir-aie's whole_array GEMM example
 ```

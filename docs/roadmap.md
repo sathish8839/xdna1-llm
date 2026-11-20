@@ -13,7 +13,7 @@ tokenizes, schedules and samples.
 | M2 | Native tokenizer, chat template, sampling and a generation loop (no llama-server needed) | ✅ |
 | M3 | Decode on the NPU: M=1 GEMV kernel, KV cache, short-conv state | ✅ |
 | M4 | **Q4_K_M** weights: Q4_K / Q6_K repacked at load and dequantized on the NPU | ✅ decode; W4A16 prefill open |
-| M5 | OpenAI-compatible server: `/v1/chat/completions` (SSE streaming, tool calls), `/v1/models` | |
+| M5 | OpenAI-compatible server: `/v1/chat/completions` (SSE streaming, tool calls), `/v1/models` | ✅ |
 | M6 | **v0.1 release:** WinUI 3 app (chat, thinking toggle, DuckDuckGo web search) and an installer with prebuilt kernels | |
 | M7 | Every op on the NPU: fused per-layer designs (norms, conv, RoPE, attention, SwiGLU) | |
 | M8 | More context (chunked prefill beyond 256 tokens, up to 8K), more small models | |
@@ -95,7 +95,7 @@ GGUF Q4_K_M mixes **Q4_K** (most tensors) and **Q6_K** (for LFM3-1.7B: `token_em
 
 ## M5–M6: server, app, installer
 
-* **Server:** OpenAI `/v1/chat/completions` with SSE streaming and `tools`, `/v1/models`, and a health
+* **Server (done, `xdna1-llm-server`):** OpenAI `/v1/chat/completions` with SSE streaming and `tools`, `/v1/models`, and a health
   endpoint. It binds to localhost by default. It is usable from Open WebUI, Unsloth Studio's external
   provider, IDE plugins and the OpenAI SDKs.
 * **App (WinUI 3, `app/`):** a chat window with streaming markdown, a **thinking** toggle (off by default) and a

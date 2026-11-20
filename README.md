@@ -23,7 +23,7 @@ and aims for the Q4_K_M quant running entirely on the NPU, behind:
 
 > [!IMPORTANT]
 > **Pre-alpha.** Prefill and token generation (Q4_K_M or Q6_K) run on the NPU and match a CPU reference, with
-> the model's own tokenizer and chat template. The server and the app are still being built. See the [roadmap](docs/roadmap.md).
+> the model's own tokenizer and chat template. An OpenAI-compatible server works; the app is still being built. See the [roadmap](docs/roadmap.md).
 
 ## Results so far
 
@@ -48,7 +48,7 @@ That is **1.6× faster and 2.5× less energy than the CPU, with the CPU nearly f
 | Decode on the NPU (KV cache): **Q4_K_M** ~14–15 tok/s, or **Q6_K** ~12–13 tok/s at near-BF16 accuracy | ✅ |
 | Batched prompt on the NPU: ~135 tok/s (689 tokens in 5 s) | ✅ |
 | Accuracy harness: perplexity and KL divergence vs BF16; NPU engine adds ~0 on top of the GGUF | ✅ |
-| OpenAI-compatible server (streaming, tool calls) | ⏳ |
+| OpenAI-compatible server (streaming, thinking, tool calls), ~14 tok/s through the OpenAI SDK | ✅ |
 | Windows app (chat, thinking toggle, web search) and installer | ⏳ |
 | Norms, conv, attention and SwiGLU fused on the NPU | ⏳ |
 
@@ -75,6 +75,7 @@ uv pip install -e ".[dev]"
 copy <xrt_sdk>\xrt\python\pyxrt.pyd .venv\Lib\site-packages\
 python -m pytest -rs                       # CPU tests, plus NPU tests when kernels are built
 xdna1-llm --gguf LFM3-1.7B-Q4_K_M.gguf --chat --prompt "Name three rivers." --generate 200 --sample  # chat (or Q6_K)
+xdna1-llm-server --gguf LFM3-1.7B-Q4_K_M.gguf   # OpenAI API at http://127.0.0.1:8080/v1
 xdna1-llm --gguf LFM3-1.7B-BF16.gguf --compare --llama-server <llama-server.exe>   # prefill vs CPU and llama.cpp
 ```
 
