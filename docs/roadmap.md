@@ -14,7 +14,7 @@ tokenizes, schedules and samples.
 | M3 | Decode on the NPU: M=1 GEMV kernel, KV cache, short-conv state | ✅ |
 | M4 | **Q4_K_M** weights: Q4_K / Q6_K repacked at load and dequantized on the NPU | ✅ |
 | M5 | OpenAI-compatible server: `/v1/chat/completions` (SSE streaming, tool calls), `/v1/models` | ✅ |
-| M6 | **v0.1 release:** WinUI 3 app (chat, thinking toggle, DuckDuckGo web search) and an installer with prebuilt kernels | ✅ [v0.1.0](https://github.com/sathish8839/xdna1-llm/releases/tag/v0.1.0) (pre-release), [v0.2.0](https://github.com/sathish8839/xdna1-llm/releases/tag/v0.2.0), [v0.3.0](https://github.com/sathish8839/xdna1-llm/releases/tag/v0.3.0) |
+| M6 | **v0.1 release:** WinUI 3 app (chat, thinking toggle, DuckDuckGo web search) and an installer with prebuilt kernels | ✅ [v0.1.0](https://github.com/sathish8839/xdna1-llm/releases/tag/v0.1.0) (pre-release), [v0.2.0](https://github.com/sathish8839/xdna1-llm/releases/tag/v0.2.0), [v0.3.0](https://github.com/sathish8839/xdna1-llm/releases/tag/v0.3.0), [v0.4.0](https://github.com/sathish8839/xdna1-llm/releases/tag/v0.4.0) |
 | M7 | Every op on the NPU: fused per-layer designs (norms, conv, RoPE, attention, SwiGLU) | SwiGLU done (prompts and decode); prompt attention on the NPU; host work overlapped with the prompt GEMM |
 | M8 | More context (up to 8K), more small models | Prompts already run in 256-token chunks; past ~1K tokens untested |
 

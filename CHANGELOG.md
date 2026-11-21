@@ -5,6 +5,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-21
+
+Long prompts take about a third less time, with the same accuracy. Prompt attention runs on the NPU, and the
+CPU work of a prompt overlaps the NPU's. For Q4_K_M, a 4K-token prompt goes from 14.1 to 9.2 s (291 → 447
+tok/s) and a 1K-token prompt from 2.9 to 2.3 s; KLD against the CPU 0.00006 (was 0.00005). Generation is
+unchanged. The v0.3.0 kernels still work, but without the new `attn` set (the installer brings it) prompt
+attention stays on the CPU.
+
 ### Added
 
 - Prompt attention on the NPU (`kernels/designs/attn.py`, `xdna1_llm.npu.attn`): flash attention on all 16
@@ -18,9 +26,9 @@ All notable changes to this project are documented here. The format follows
 - Prompts run layer by layer (every chunk through a layer before the next layer), so the NPU switches between
   the GEMM and attention contexts twice per attention layer instead of twice per chunk.
 - The CPU work of a prompt overlaps the NPU: the prompt GEMM runs while the host works (`submit` / `collect`),
-  two chunks are in flight, and the CPU ops write into reused scratch arrays instead of fresh ones (on Windows
-  a fresh multi-MB array costs ~0.3 ms in page faults). Q4_K_M prompts: 4K tokens 11.1 → 9.2 s
-  (370 → 447 tok/s), 1K tokens 2.76 → 2.30 s; the output is identical.
+  two chunks are in flight, and the CPU ops, the attention output and the q/k/v GEMM result go into reused
+  arrays instead of fresh ones (on Windows a fresh multi-MB array costs ~0.3 ms in page faults). Q4_K_M
+  prompts: 4K tokens 11.1 → 9.2 s (370 → 447 tok/s), 1K tokens 2.76 → 2.30 s; the output is identical.
 
 ## [0.3.0] - 2026-11-21
 
@@ -178,7 +186,8 @@ OpenAI-compatible local server. Tested on one laptop (Ryzen 7 250) with NPU driv
 - `eval_quality.py` started every chunk with the text's first token instead of BOS (llama.cpp adds no BOS for
   LFM3); accuracy numbers re-measured.
 
-[Unreleased]: https://github.com/sathish8839/xdna1-llm/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/sathish8839/xdna1-llm/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/sathish8839/xdna1-llm/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/sathish8839/xdna1-llm/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/sathish8839/xdna1-llm/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/sathish8839/xdna1-llm/releases/tag/v0.1.0
