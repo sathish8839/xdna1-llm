@@ -9,7 +9,13 @@ x travels on the same lane ahead of the weights, with a header (blocks, tiles pe
 program depends on nothing: every build has the same cores, and one context runs every format and shape; only
 the instruction stream (the host-side DMA program, sized by -Q -N -K) differs per matrix.
 
-    python qgemv.py --dev npu -Q 4 -N 2048 -K 2048 [--geometry q6only] --xclbin-path X --insts-path Y
+--glu builds an FFN gate + up program (rows stored in 16-row blocks gate, up, ...; the host sets the glu flag in
+the header): the cores emit bf16(silu(gate) * up) after each up block, and the output goes into one buffer laid
+out [junk: N/4 words][the down projection's x buffer][junk], so the down GEMV (reading x through a sub-buffer
+at word N/4) can run right after it, queued, with no host work in between. Its header is the host's, written
+once; only act and its slack land around it.
+
+    python qgemv.py --dev npu -Q 4 -N 2048 -K 2048 [--geometry q6only] [--glu] --xclbin-path X --insts-path Y
 
 --geometry picks the tile size (xdna1_llm.q4k.Geometry): `unified` serves both formats in one program, `q6only`
 uses 512-column Q6_K tiles with no padding for LFM3's K = 2048 and 7680.
@@ -38,7 +44,17 @@ SRC = str(Path(__file__).parent / "qgemv.cc")
 
 
 @iron.jit
-def qgemv(W: In, X: In, Y: Out, *, Q: CompileTime[int], N: CompileTime[int], K: CompileTime[int], G: CompileTime[str]):
+def qgemv(
+    W: In,
+    X: In,
+    Y: Out,
+    *,
+    Q: CompileTime[int],
+    N: CompileTime[int],
+    K: CompileTime[int],
+    G: CompileTime[str],
+    GLU: CompileTime[bool] = False,
+):
     tile_bytes, kc4, kc6 = GEOMETRIES[G]
     assert Q in (4, 6) and N % (LANES * RB) == 0 and K % 256 == 0 and K <= K_MAX, (Q, N, K)
     n_tiles = -(-K // (kc4 if Q == 4 else kc6))
@@ -54,7 +70,11 @@ def qgemv(W: In, X: In, Y: Out, *, Q: CompileTime[int], N: CompileTime[int], K: 
         "qg_load_x", source_file=SRC, arg_types=[tile_ty, x_ty, hdr_ty], compile_flags=["-DQG_FN=0", *geo]
     )
     rows = ExternalFunction(
-        "qg_rows", source_file=SRC, arg_types=[tile_ty, x_ty, y_ty], compile_flags=["-DQG_FN=1", *geo]
+        "qg_rows",
+        source_file=SRC,
+        arg_types=[tile_ty, x_ty, y_ty],
+        compile_flags=["-DQG_FN=1", *geo],
+        include_dirs=[str(Path(__file__).parent)],  # silu_lut.h
     )
 
     def core_fn(of_in, of_out, xbuf, hdr, load_x, rows):
@@ -94,7 +114,16 @@ def qgemv(W: In, X: In, Y: Out, *, Q: CompileTime[int], N: CompileTime[int], K: 
         )
         for lane in range(LANES)
     ]
+    y_words = N
     y_taps = TensorAccessPattern.full((N,)).partition(LANES)
+    if GLU:  # per lane, pair of blocks, half: gate block -> junk, up block's first 8 words (act) -> down's x
+        act, xw = N // 4, x_tiles * tile_bytes // 4  # act and the x buffer, in words
+        pairs = N // (2 * RB * LANES)  # per lane
+        y_words = 2 * act + act + xw
+        y_taps = [
+            TensorAccessPattern((y_words,), lane * pairs * 8, [pairs, 2, 2, 8], [8, act, act + xw, 1])
+            for lane in range(LANES)
+        ]
 
     def sequence(w, x, y, in_hs, out_hs):
         for i in range(LANES):
@@ -104,7 +133,8 @@ def qgemv(W: In, X: In, Y: Out, *, Q: CompileTime[int], N: CompileTime[int], K: 
             out_hs[i].drain(y, y_taps[i], wait=True)
 
     x_all = np.ndarray[(x_tiles * tile_bytes,), u8]
-    rt = Runtime(sequence, [np.ndarray[(n_bytes,), u8], x_all, np.ndarray[(N,), np.dtype[np.float32]], ins, outs])
+    y_all = np.ndarray[(y_words,), np.dtype[np.float32]]
+    rt = Runtime(sequence, [np.ndarray[(n_bytes,), u8], x_all, y_all, ins, outs])
     return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
 
 
@@ -115,11 +145,12 @@ def main():
     p.add_argument("--geometry", choices=sorted(GEOMETRIES), default="unified")
     p.add_argument("-N", type=int, required=True)
     p.add_argument("-K", type=int, required=True)
+    p.add_argument("--glu", action="store_true", help="FFN gate + up: emit silu(gate) * up into the down's x")
     opts = p.parse_args()
     run_design_cli(
         qgemv,
         opts,
-        compile_kwargs=lambda o: dict(Q=o.Q, N=o.N, K=o.K, G=o.geometry),
+        compile_kwargs=lambda o: dict(Q=o.Q, N=o.N, K=o.K, G=o.geometry, GLU=o.glu),
         run_and_verify=lambda o: None,
         device=lambda o: device_from_args(o, n_cols=4),
     )

@@ -78,7 +78,13 @@ def qgemm(
     dequant = ExternalFunction(
         "qm_dequant", source_file=SRC, arg_types=[b_ty, bb_ty, rtp_ty], compile_flags=["-DQM_FN=0"]
     )
-    finish = ExternalFunction("qm_finish", source_file=SRC, arg_types=[c_ty, rtp_ty], compile_flags=["-DQM_FN=1"])
+    finish = ExternalFunction(
+        "qm_finish",
+        source_file=SRC,
+        arg_types=[c_ty, rtp_ty],
+        compile_flags=["-DQM_FN=1"],
+        include_dirs=[str(Path(__file__).parent)],  # silu_lut.h
+    )
 
     a_l3, b_l3, c_l3 = [], [], []
     a_l1, b_l1, c_l1 = [], [], [[] for _ in range(ROWS)]

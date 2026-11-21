@@ -108,10 +108,13 @@ if [[ "$SET" == qgemv || "$SET" == all ]]; then
   for shape in 512x2048 128000x2048 2048x7680; do
     design "q6_$shape" qgemv.py -Q 6 -N "${shape%x*}" -K "${shape#*x}"
   done
+  # FFN gate + up with silu(gate) * up on the cores, written into the down projection's x (NpuQLinear.ffn)
+  design q4_15360x2048_glu qgemv.py -Q 4 -N 15360 -K 2048 --glu
   # q6only geometry (no padding), all-Q6_K models: every tensor
   for shape in 2048x2048 3072x2048 6144x2048 15360x2048 128000x2048 2048x7680; do
     design "q6only_$shape" qgemv.py -Q 6 -N "${shape%x*}" -K "${shape#*x}" --geometry q6only
   done
+  design q6only_15360x2048_glu qgemv.py -Q 6 -N 15360 -K 2048 --geometry q6only --glu
 fi
 if [[ "$SET" == qgemm || "$SET" == all ]]; then
   # the prompt GEMM reads the qgemv weights, so it has the same shapes (minus the LM head, which stays on the

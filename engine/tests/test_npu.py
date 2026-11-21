@@ -152,3 +152,33 @@ def test_npu_qgemm_fused_ffn(npu, kinds, geometry):
         np.testing.assert_allclose(y, ref, rtol=0, atol=5e-3 * np.abs(ref).max())
     ref = xb[:2] @ np.vstack([mod.dequantize(g), mod.dequantize(u)]).T.astype(np.float64)  # GEMV: exact weights
     np.testing.assert_allclose(lin("gateup", x[:2]), ref, rtol=0, atol=1e-4 * np.abs(ref).max())
+
+
+@pytest.mark.parametrize(("kinds", "geometry"), [(("Q4_K", "Q6_K"), "unified"), (("Q6_K", "Q6_K"), "q6only")])
+def test_npu_qlinear_fused_ffn(npu, kinds, geometry):
+    """The decode FFN chain: gate + up's cores write silu(gate) * up into down's x, and down runs queued behind
+    it. Against numpy with the exact GGUF dequantization (the GEMV's weights), act rounded to bf16 as on the host."""
+    from xdna1_llm.npu.qlinear import NpuQLinear
+
+    lin = NpuQLinear(npu, formats=set(kinds))
+    d, ff = 2048, 7680
+    gu, dn = kinds
+    fused = lin.geo.program(4 if gu == "Q4_K" else 6, 2 * ff, d) + "_glu"
+    if not os.path.exists(os.path.join(lin.kdir, fused + ".bin")):
+        pytest.skip(f"{fused} not built (kernels/build_kernels.sh <out> qgemv)")
+    rng = np.random.default_rng(3)
+    (g, mod), (u, _), (w2, mod2) = (random_quant(kd, n, k, rng) for kd, n, k in [(gu, ff, d), (gu, ff, d), (dn, d, ff)])
+    lin.register("gateup", [(gu, g), (gu, u)], glu=True)
+    lin.register("down", (dn, w2))
+    wg, wu, wd = (m.dequantize(raw).astype(np.float64) for raw, m in [(g, mod), (u, mod), (w2, mod2)])
+    x = 4 * rng.standard_normal((3, d)).astype(np.float32)
+    xb = from_bf16(to_bf16(x)).astype(np.float64)
+    G, U = xb @ wg.T, xb @ wu.T
+    act = from_bf16(to_bf16((G / (1 + np.exp(-np.maximum(G, -80))) * U).astype(np.float32))).astype(np.float64)
+    ref = act @ wd.T
+    for _ in range(2):  # the second time reuses the chain's runs and buffers
+        y = lin.ffn("gateup", "down", x)
+        assert y.shape == (3, d)
+        np.testing.assert_allclose(y, ref, rtol=0, atol=5e-3 * np.abs(ref).max())
+    y_unfused = lin("down", (G / (1 + np.exp(-np.maximum(G, -80))) * U).astype(np.float32))
+    np.testing.assert_allclose(y, y_unfused, rtol=0, atol=5e-3 * np.abs(ref).max())

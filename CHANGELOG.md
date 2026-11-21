@@ -12,11 +12,20 @@ All notable changes to this project are documented here. The format follows
   SiLU and the bf16 conversion are gone: an 814-token Q4_K_M prompt takes 4.29 s instead of 5.39 s (~20 %
   less, same machine and session), KLD 0.00005 against the CPU. SiLU uses a 64-segment sigmoid table, since AIE2
   has no fp32 vector multiplier. New builds `qm4_15360x2048_glu` and `qm6only_15360x2048_glu` in the `qgemm` set.
+- Fused FFN for decode (`NpuQLinear.ffn`): the gate + up GEMV's cores write silu(gate) · up as bf16 straight
+  into the down GEMV's input, and the down GEMV is queued right behind it, so an FFN costs one round trip
+  instead of two and no host work in between. Together with reusing each GEMV's run (below), Q4_K_M generation
+  goes from 12.7 to 15.0 tok/s (+18 %, same machine, alternating runs), KLD 0.00003 against the CPU. New builds
+  `q4_15360x2048_glu` and `q6only_15360x2048_glu` in the `qgemv` set; the SiLU table is shared with the GEMM
+  (`kernels/designs/silu_lut.h`).
 
 ### Changed
 
 - FFN gate and up weights are stored with their rows interleaved in blocks of 16 (`xdna1_llm.npu.qlinear`), so
-  the weight cache rebuilds on the first load. The `qgemm` cores changed, so every `qgemm` build must be rebuilt.
+  the weight cache rebuilds on the first load. The `qgemm` and `qgemv` cores changed, so every build of both
+  sets must be rebuilt.
+- Each decode GEMV keeps one prebuilt XRT run and starts it again (`Kernel.prepare`) instead of building a run
+  per call: ~0.025 ms less per call, ~10 % faster generation on its own.
 
 ## [0.2.0] - 2026-11-21
 

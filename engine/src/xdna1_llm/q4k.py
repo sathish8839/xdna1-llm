@@ -101,12 +101,14 @@ def layout(K: int, fmt: int = 4, geo: Geometry = UNIFIED) -> tuple[int, int]:
     return geo.kc(fmt), -(-K // geo.kc(fmt))
 
 
-def x_input(xbits: np.ndarray, fmt: int, N: int, K: int, geo: Geometry = UNIFIED) -> np.ndarray:
-    """The kernel's x input (geo.x_tiles tiles): x as bf16 bits, then [blocks per lane, tiles per block, format,
-    K] as int32 in the last 16 bytes."""
+def x_input(xbits: np.ndarray, fmt: int, N: int, K: int, geo: Geometry = UNIFIED, glu: bool = False) -> np.ndarray:
+    """The kernel's x input (geo.x_tiles tiles): x as bf16 bits, then [blocks per lane, tiles per block,
+    format + 256 * glu, K] as int32 in the last 16 bytes. glu: an FFN gate + up whose cores emit silu(gate) * up
+    (kernels/designs/qgemv.cc)."""
     buf = np.zeros(geo.x_tiles * geo.tile, np.uint8)
     buf[: 2 * K] = np.asarray(xbits, np.uint16).view(np.uint8)
-    buf[-16:] = np.array([N // LANES // RB, layout(K, fmt, geo)[1], fmt, K], np.int32).view(np.uint8)
+    head = [N // LANES // RB, layout(K, fmt, geo)[1], fmt + 256 * glu, K]
+    buf[-16:] = np.array(head, np.int32).view(np.uint8)
     return buf
 
 

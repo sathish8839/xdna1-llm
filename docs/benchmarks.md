@@ -154,6 +154,25 @@ runs as a batch on the bf16 GEMM ([3d](#3d-batched-prompt)); the table below fed
 * What is left is mostly the kernels themselves (~60 ms per token, a third of it in Q6_K: LM head and half of
   FFN down). The other calls depend on CPU work between them (norms, short conv, attention, SwiGLU), so fusing
   further means moving that work onto the NPU.
+* **Later (decode host work and the FFN chain):** a profile of one Q4_K_M token (76 ms on a slow day) gave
+  52 ms in the kernels, ~15 ms of host work around the 97 calls and 8 ms of CPU ops. Syncs and copies of the
+  small buffers cost ~1 µs; the rest is the round trip of each call. Two changes:
+  * each GEMV keeps one prebuilt run and starts it again (building a run per call cost ~0.03 ms): ~10 %;
+  * the FFN as one chain: the gate + up GEMV's cores (`--glu` build, glu flag in the x header) keep each gate
+    block's 16 outputs and, after the matching up block, write bf16(silu(gate) · up) (the GEMM's sigmoid table,
+    `kernels/designs/silu_lut.h`). The output pattern puts those 32 bytes per block pair into a buffer laid out
+    [junk][down's x and header][junk], and the down GEMV reads its x there through an XRT sub-buffer, queued
+    right behind: one round trip per FFN instead of two, no silu · mul, x conversion or readback on the host.
+    +7 % on Q4_K_M, +10 % on Q6_K, in alternating rounds.
+
+  | Q4_K_M, 96 generated tokens, alternating processes | v0.2.0 | now |
+  |---|---|---|
+  | generation | 12.7 tok/s | **15.0 tok/s** (+18 %) |
+  | linears per token | 68 ms | 57 ms |
+  | 31-token prompt on the GEMV | 16.6 tok/s | 20.2 tok/s |
+
+  The machine was in its slower state for this run (on a faster day the same build reaches ~17 tok/s). KLD of
+  token-by-token decode against the CPU run of the same file: 0.00003 (was 0.00002).
 * llama.cpp's greedy output for the same prompt diverges after a few tokens where two candidates are close.
   At that step both the fp32 reference and llama.cpp's own prompt evaluation rank our token first; llama.cpp's
   CPU decode path rounds activations to 8 bits, so its token-by-token output differs slightly from its own

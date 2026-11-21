@@ -24,7 +24,12 @@
 //         groups    per 16 k: sc[16] (bf16)
 //         d         d_hi[16], d_lo[16]
 // x arrives first, over X_TILES tiles: x as bf16 from byte 0, and a header in the last 16 bytes of the last tile:
-// [16-row blocks for this lane, tiles per block, format (4 or 6), K].
+// [16-row blocks for this lane, tiles per block, format (4 or 6) + 256 * glu, K].
+//
+// glu = 1 (FFN gate + up, rows stored in 16-row blocks gate, up, gate, ...): after each up block the core writes
+// bf16(silu(gate) * up) of the pair's 16 rows to the first 32 bytes of the block's output (silu_lut.h); the
+// gate block's output is left as it is. The host's DMA pattern (qgemv.py --glu) puts those 32 bytes where the
+// down projection reads its x, and the rest elsewhere.
 //
 // Quantized values become bf16 exactly with the exponent trick (0x4300 | q) == 128 + q; the offset (128, plus 32
 // for Q6_K) times sum(x) is removed per group. AIE2 has no fast fp32 multiply, so every scaling step is a native
@@ -51,10 +56,16 @@
 #define SB4 2688  // bytes per super-block (xdna1_llm.q4k.SB_BYTES); a Q4_K tile is shorter than TILE_BYTES
 #define SB6 3648
 
+#if QG_FN == 1
+#include "silu_lut.h"  // glu(): bf16(silu(g) * u)
+#endif
+
 extern "C" {
 
 #if QG_FN == 0
 int32_t qg_fmt, qg_k, qg_tiles, qg_chunk;  // format, row length, tiles per block, next tile of the current block
+int32_t qg_glu, qg_odd;                    // glu mode; the current block is an up block
+alignas(aie::vector_decl_align) float qg_gate[RB];  // glu: the gate block's outputs (vector loads need the alignment)
 float qg_acc[RB];                          // partial outputs of the current block
 float qg_xoff[K_MAX / 16];                 // per group: (128 or 160) * sum(x)
 bfloat16 qg_xs_hi[K_MAX / 32], qg_xs_lo[K_MAX / 32];  // Q4_K, per group: sum(x) as bf16 high + low parts
@@ -72,7 +83,9 @@ void qg_load_x(const uint8_t *__restrict src, bfloat16 *__restrict x, int32_t *_
   hdr[0] = h[0];
   hdr[1] = h[1];
   qg_tiles = h[1];
-  qg_fmt = h[2];
+  qg_fmt = h[2] & 0xFF;
+  qg_glu = h[2] >> 8;
+  qg_odd = 0;
   qg_k = h[3];
   if (qg_fmt == 4) {
     for (int g = 0; g < qg_k / 32; g++) {
@@ -95,6 +108,8 @@ void qg_load_x(const uint8_t *__restrict src, bfloat16 *__restrict x, int32_t *_
 }
 #else
 extern int32_t qg_fmt, qg_k, qg_tiles, qg_chunk;
+extern int32_t qg_glu, qg_odd;
+extern float qg_gate[RB];
 extern float qg_acc[RB];
 extern float qg_xoff[K_MAX / 16];
 extern bfloat16 qg_xs_hi[K_MAX / 32], qg_xs_lo[K_MAX / 32];
@@ -219,8 +234,19 @@ void qg_rows(const uint8_t *__restrict w, const bfloat16 *__restrict x, float *_
   acc_y = qg_fmt == 4 ? q4_tile(w, x, acc_y, nsb) : q6_tile(w, x, acc_y, nsb);
   if (++qg_chunk < qg_tiles) {
     aie::store_v(qg_acc, acc_y.to_vector<float>());
-  } else {  // block done: emit its 16 outputs
+  } else if (!qg_glu) {  // block done: emit its 16 outputs
     aie::store_v(y, acc_y.to_vector<float>());
+    aie::store_v(qg_acc, aie::zeros<float, RB>());
+    qg_chunk = 0;
+  } else {  // glu: keep a gate block, emit bf16(silu(gate) * up) after its up block
+    if (qg_odd) {  // rounded to nearest even, as the host rounds x; the GEMV's own splits keep their mode
+      const aie::rounding_mode mode = aie::get_rounding();
+      aie::set_rounding(aie::rounding_mode::conv_even);
+      aie::store_v((bfloat16 *)y, glu(aie::load_v<16>(qg_gate), acc_y.to_vector<float>()));
+      aie::set_rounding(mode);
+    } else
+      aie::store_v(qg_gate, acc_y.to_vector<float>());
+    qg_odd ^= 1;
     aie::store_v(qg_acc, aie::zeros<float, RB>());
     qg_chunk = 0;
   }

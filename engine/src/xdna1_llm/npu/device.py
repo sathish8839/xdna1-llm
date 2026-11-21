@@ -102,6 +102,15 @@ class Kernel:
         bo_instr, n = self.programs[program]
         return self.kernel(3, bo_instr, n, *bos)
 
+    def prepare(self, *bos, program: str = "default"):
+        """A run with its arguments set, to start again and again (run.start(); finish(run)): ~0.025 ms less per
+        call than start(), which builds a new run each time."""
+        bo_instr, n = self.programs[program]
+        run = xrt.run(self.kernel)
+        for i, arg in enumerate((3, bo_instr, n, *bos)):
+            run.set_arg(i, arg)
+        return run
+
     def run(self, *bos, program: str = "default"):
         finish(self.start(*bos, program=program), self.tag)
 
@@ -124,6 +133,11 @@ def finish(run, what: str = "kernel", spin_s: float = 0.05):
         st = run.wait()
     if st != COMPLETED:
         raise RuntimeError(f"{what}: {st}")
+
+
+def sub_bo(bo, nbytes: int, offset: int):
+    """A buffer object for nbytes of bo from offset: a kernel argument that reads or writes inside another one."""
+    return xrt.bo(bo, nbytes, offset)
 
 
 def mapped(bo, dtype, shape=None) -> np.ndarray:

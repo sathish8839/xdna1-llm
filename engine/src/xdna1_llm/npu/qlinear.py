@@ -10,8 +10,9 @@ other quantized type and those builds exist.
 
 Weights whose parts share a format and K (for example ffn_gate + ffn_up) run as one GEMV with stacked rows.
 An FFN's gate + up (registered with glu=True) is stored with its rows interleaved in blocks of 16, gate then up,
-the layout the prompt GEMM's fused FFN needs (xdna1_llm.npu.qgemm, NpuQGemm.ffn); results come back in the
-registered order.
+the layout the fused FFNs need; results come back in the registered order. Fused (ffn), gate + up runs on its
+`_glu` build, whose cores write silu(gate) * up as bf16 straight into the down projection's x, and the down GEMV
+is queued right behind it: one round trip per FFN instead of two, and no host work in between.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ import numpy as np
 from .. import q4k, q6k
 from ..bf16 import to_bf16
 from ..gguf_weights import as_parts
-from .device import FROM_DEV, TO_DEV, Npu, finish, mapped
+from .device import FROM_DEV, TO_DEV, Npu, finish, mapped, sub_bo
 
 FORMATS = {"Q4_K": (4, q4k), "Q6_K": (6, q6k)}
 GLU_ROWS = 16  # rows per gate / up block of an interleaved FFN weight: half of a GEMM core's 32 outputs
@@ -69,6 +70,7 @@ class NpuQLinear:
         path = os.path.join(self.kdir, built[0])  # every build of a geometry has the same cores
         self.kern = self.npu.load("qgemv_" + self.geo.name, path + ".xclbin", path + ".bin")
         self.mats: dict[str, list[dict]] = {}
+        self.chains: dict[tuple[str, str], tuple | None] = {}  # (gate + up, down) -> fused FFN runs, or None
         self.npu_ms, self.calls, self.repack_s = 0.0, 0, 0.0
 
     def register(self, name: str, w, glu: bool = False):
@@ -109,7 +111,8 @@ class NpuQLinear:
             bo_y = self.npu.bo(N * 4, self.kern.group(2))
             bo_x = self.npu.bo(self.geo.x_tiles * self.geo.tile, self.kern.group(1))  # own x: groups can queue
             x, y = mapped(bo_x, np.uint8), mapped(bo_y, np.float32)
-            mats.append(dict(fmt=fmt, prog=prog, N=N, K=K, glu=il, bo_w=bo_w, bo_x=bo_x, x=x, bo_y=bo_y, y=y))
+            run = self.kern.prepare(bo_w, bo_x, bo_y, program=prog)  # one run per matrix, started every call
+            mats.append(dict(fmt=fmt, prog=prog, N=N, K=K, glu=il, bo_w=bo_w, bo_x=bo_x, x=x, bo_y=bo_y, y=y, run=run))
         self.mats[name] = mats
 
     def __call__(self, name: str, x: np.ndarray) -> np.ndarray:
@@ -125,7 +128,8 @@ class NpuQLinear:
             for m in mats:
                 m["x"][:] = q4k.x_input(xbits, m["fmt"], m["N"], m["K"], self.geo)
                 m["bo_x"].sync(TO_DEV)
-                runs.append(self.kern.start(m["bo_w"], m["bo_x"], m["bo_y"], program=m["prog"]))
+                m["run"].start()
+                runs.append(m["run"])
             col = 0
             for m, r in zip(mats, runs, strict=True):
                 finish(r, m["prog"])
@@ -133,5 +137,60 @@ class NpuQLinear:
                 out[t, col : col + m["N"]] = deinterleave(m["y"]) if m["glu"] else m["y"]
                 col += m["N"]
             self.calls += len(mats)
+        self.npu_ms += (time.perf_counter() - t0) * 1e3
+        return out
+
+    def _chain(self, gateup: str, down: str):
+        """The fused FFN's runs, made on first use: gate + up's _glu program writing into a buffer laid out
+        [junk: N/4 words][down's x and header][junk] (kernels/designs/qgemv.py --glu), and down reading its x
+        there through a sub-buffer. None if the weights or the build do not allow it."""
+        key = (gateup, down)
+        if key in self.chains:
+            return self.chains[key]
+        self.chains[key] = None
+        g, d = self.mats.get(gateup, ()), self.mats.get(down, ())
+        if len(g) != 1 or len(d) != 1 or not g[0]["glu"] or d[0]["K"] != g[0]["N"] // 2:
+            return None
+        g, d = g[0], d[0]
+        prog = g["prog"] + "_glu"
+        insts = os.path.join(self.kdir, prog + ".bin")
+        if prog not in self.kern.programs:
+            if not os.path.exists(insts):
+                return None
+            self.kern.add_program(prog, insts)
+        xbytes, act = self.geo.x_tiles * self.geo.tile, g["N"]  # act: N / 2 bf16 = N bytes
+        buf = self.npu.bo(3 * act + xbytes, self.kern.group(2))
+        mapped(buf, np.uint8)[act : act + xbytes] = q4k.x_input(
+            np.zeros(d["K"], np.uint16), d["fmt"], d["N"], d["K"], self.geo
+        )
+        buf.sync(TO_DEV)  # the header stays; the cores only write act and the junk around it
+        x = sub_bo(buf, xbytes, act)
+        runs = (
+            self.kern.prepare(g["bo_w"], g["bo_x"], buf, program=prog),
+            self.kern.prepare(d["bo_w"], x, d["bo_y"], program=d["prog"]),
+        )
+        self.chains[key] = (g, d, prog, buf, x, *runs)
+        return self.chains[key]
+
+    def ffn(self, gateup: str, down: str, x: np.ndarray) -> np.ndarray | None:
+        """down(silu(gate(x)) * up(x)) for x (T, K) float32 -> (T, N_down) float32, the two GEMVs queued per row;
+        None if these weights do not run fused (not stored interleaved, or no _glu build)."""
+        chain = self._chain(gateup, down)
+        if chain is None:
+            return None
+        g, d, prog, _, _, run_g, run_d = chain
+        x = np.atleast_2d(x)
+        t0 = time.perf_counter()
+        out = np.empty((len(x), d["N"]), np.float32)
+        for t in range(len(x)):
+            g["x"][:] = q4k.x_input(to_bf16(x[t]), g["fmt"], g["N"], g["K"], self.geo, glu=True)
+            g["bo_x"].sync(TO_DEV)
+            run_g.start()
+            run_d.start()
+            finish(run_g, prog)
+            finish(run_d, d["prog"])
+            d["bo_y"].sync(FROM_DEV)
+            out[t] = d["y"]
+            self.calls += 2
         self.npu_ms += (time.perf_counter() - t0) * 1e3
         return out
