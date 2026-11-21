@@ -14,8 +14,8 @@ tokenizes, schedules and samples.
 | M3 | Decode on the NPU: M=1 GEMV kernel, KV cache, short-conv state | ✅ |
 | M4 | **Q4_K_M** weights: Q4_K / Q6_K repacked at load and dequantized on the NPU | ✅ |
 | M5 | OpenAI-compatible server: `/v1/chat/completions` (SSE streaming, tool calls), `/v1/models` | ✅ |
-| M6 | **v0.1 release:** WinUI 3 app (chat, thinking toggle, DuckDuckGo web search) and an installer with prebuilt kernels | ✅ [v0.1.0](https://github.com/sathish8839/xdna1-llm/releases/tag/v0.1.0) (pre-release) |
-| M7 | Every op on the NPU: fused per-layer designs (norms, conv, RoPE, attention, SwiGLU) | |
+| M6 | **v0.1 release:** WinUI 3 app (chat, thinking toggle, DuckDuckGo web search) and an installer with prebuilt kernels | ✅ [v0.1.0](https://github.com/sathish8839/xdna1-llm/releases/tag/v0.1.0) (pre-release), [v0.2.0](https://github.com/sathish8839/xdna1-llm/releases/tag/v0.2.0) |
+| M7 | Every op on the NPU: fused per-layer designs (norms, conv, RoPE, attention, SwiGLU) | SwiGLU done (prompts) |
 | M8 | More context (chunked prefill beyond 256 tokens, up to 8K), more small models | |
 
 M7 is listed after the release on purpose. Linear layers are more than 95% of the FLOPs and nearly all of the
@@ -66,7 +66,8 @@ These come from measurements in [benchmarks.md](benchmarks.md) (the last one is 
 * Batched prompt: done. Prompt chunks of 32–256 tokens run on the W4A16 GEMM over the decode weights, then
   decode continues from the same state: ~200 tok/s instead of 16, KLD 0.00004 against the CPU
   ([benchmarks 3d](benchmarks.md#3d-batched-prompt)).
-* Next: the CPU ops between calls on the NPU (M7) so a layer needs fewer round trips.
+* Next: the CPU ops between calls on the NPU (M7) so a layer needs fewer round trips. The FFN's SwiGLU is
+  done for prompts: ~20 % less prompt time ([benchmarks 3d](benchmarks.md#3d-batched-prompt)).
   The GEMV loop still waits on latency more than on the MAC unit (broadcasting x is the largest remaining cost);
   32-row blocks would share each broadcast between two MACs.
 
@@ -119,7 +120,7 @@ Per-layer fused designs, one xclbin each (≤ 4 contexts total):
 |---|---|
 | `conv_layer` | RMSNorm → in_proj → B·x → causal depthwise conv (k=7) → C·y → out_proj → RMSNorm → residual |
 | `attn_layer` | RMSNorm → q/kv → q/k RMSNorm → partial RoPE → GQA attention → sigmoid gate → o_proj → RMSNorm → residual |
-| `ffn` | RMSNorm → gate+up → SiLU·mul → down → RMSNorm → residual |
+| `ffn` | RMSNorm → gate+up → SiLU·mul → down → RMSNorm → residual (gate+up → SiLU·mul → down: done, in the prompt GEMM's context) |
 | `lm_head` | final RMSNorm → tied head (128K vocab, chunked) → top-k |
 
 The hidden state stays in one device buffer across designs. Each design is validated op by op against the numpy

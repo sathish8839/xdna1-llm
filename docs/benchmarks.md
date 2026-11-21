@@ -187,6 +187,19 @@ on it. Two contexts in all. Before it, prompts ran on the bf16 GEMM (section 4) 
   returns a single-matrix output as a view of its device buffer (two buffer sets in turn, so a result outlives
   the next call): 4.33 → 3.91 s for the same prompt, median of 5 alternating runs. Of the remaining ~3.9 s,
   the NPU takes 1.3 s, host work around the calls ~0.4 s and the CPU ops between calls ~2.1 s (M7).
+* **Fused FFN:** the gate + up GEMM's cores compute silu(gate) · up and round it to bf16, and the down
+  projection reads it from the device. Gate and up rows are interleaved in blocks of 16, so each core holds
+  matching columns of both. The 15 MB gate + up result, the CPU's SiLU · mul (~0.7 s per prompt) and the bf16
+  conversion of act are gone. Same machine and session, alternating processes, 814 tokens: v0.2.0
+  5.39 s (151 tok/s), fused **4.29 s (190 tok/s)**; the CPU ops drop from 3.2 to 2.2 s. (Both are slower than
+  the 3.9 s above, which was measured with the machine in a faster state.) KLD against the CPU 0.00005 (p99
+  0.0003, 99.7 % same top-1), as before.
+* The SiLU: AIE2 has no fp32 vector multiplier (an fp32 `aie::mul` is a bf16 emulation), and an fp32 exp and
+  reciprocal cost ~400 cycles per 16 values, which made gate + up 13.3 ms instead of 7.6. A 64-segment sigmoid
+  table over [-8, 8) (mlir-aie's parallel table lookup, error ≤ 4.3e-4), with the products done as bf16 macs
+  on split operands, makes the epilogue nearly free: 9.7–10.6 ms. Most of what remains is the act write:
+  each core's 16 act columns are only 32 bytes per row in DDR, and the other 3/4 of the stream go to a scratch
+  region. The kernel alone matches numpy to 1.4e-3 of the largest output.
 * Chunks shorter than 32 tokens stay on the GEMV: the GEMM always computes 256 rows, which takes about as long
   as ~25 single-token steps.
 * The weight cache now holds only the GEMV tiles, 1.2 GB instead of 3.9 GB. Loading Q4_K_M through

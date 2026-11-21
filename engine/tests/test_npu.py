@@ -116,3 +116,39 @@ def test_npu_qgemm_matches_bf16_weights(npu, kinds, geometry):
     kept = y.copy()  # a result stays valid through the next call (two output buffer sets, used in turn)
     gemm("w", rng.standard_normal((T, k)).astype(np.float32))
     np.testing.assert_array_equal(y, kept)
+
+
+@pytest.mark.parametrize(("kinds", "geometry"), [(("Q4_K", "Q6_K"), "unified"), (("Q6_K", "Q6_K"), "q6only")])
+def test_npu_qgemm_fused_ffn(npu, kinds, geometry):
+    """The fused FFN (gate + up with silu * up on the cores, then down on the act left on the device) against
+    numpy, and the interleaved gate + up through the unfused paths: the prompt GEMM and the decode GEMV."""
+    from xdna1_llm.npu.qgemm import NpuQGemm, program
+    from xdna1_llm.npu.qlinear import NpuQLinear
+
+    lin = NpuQLinear(npu, formats=set(kinds))
+    d, ff = 2048, 7680
+    gu, dn = kinds
+    fused = program(lin.geo, 4 if gu == "Q4_K" else 6, 2 * ff, d) + "_glu"
+    if not os.path.exists(os.path.join(lin.kdir, fused + ".bin")):
+        pytest.skip(f"{fused} not built (kernels/build_kernels.sh <out> qgemm)")
+    rng = np.random.default_rng(2)
+    (g, mod), (u, _), (w2, mod2) = (random_quant(kd, n, k, rng) for kd, n, k in [(gu, ff, d), (gu, ff, d), (dn, d, ff)])
+    lin.register("gateup", [(gu, g), (gu, u)], glu=True)
+    lin.register("down", (dn, w2))
+    gemm = NpuQGemm(lin)
+    gemm.register("gateup")
+    gemm.register("down")
+    deq = lambda raw, m: from_bf16(to_bf16(m.dequantize(raw))).astype(np.float64)  # noqa: E731
+    wg, wu, wd = deq(g, mod), deq(u, mod), deq(w2, mod2)
+    for T in (256, 37):
+        x = 4 * rng.standard_normal((T, d)).astype(np.float32)
+        xb = from_bf16(to_bf16(x)).astype(np.float64)
+        G, U = xb @ wg.T, xb @ wu.T
+        np.testing.assert_allclose(gemm("gateup", x), np.hstack([G, U]), rtol=0, atol=1e-3 * np.abs(G).max())
+        act = from_bf16(to_bf16((G / (1 + np.exp(-np.maximum(G, -80))) * U).astype(np.float32))).astype(np.float64)
+        ref = act @ wd.T
+        y = gemm.ffn("gateup", "down", x)
+        assert y.shape == (T, d)
+        np.testing.assert_allclose(y, ref, rtol=0, atol=5e-3 * np.abs(ref).max())
+    ref = xb[:2] @ np.vstack([mod.dequantize(g), mod.dequantize(u)]).T.astype(np.float64)  # GEMV: exact weights
+    np.testing.assert_allclose(lin("gateup", x[:2]), ref, rtol=0, atol=1e-4 * np.abs(ref).max())

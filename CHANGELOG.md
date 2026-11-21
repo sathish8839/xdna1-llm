@@ -5,6 +5,19 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Fused FFN for prompts (`NpuQGemm.ffn`): the gate + up GEMM computes silu(gate) · up on the NPU cores and
+  leaves it in bf16 on the device, where the down projection reads it. The 15 MB gate + up result, the CPU's
+  SiLU and the bf16 conversion are gone: an 814-token Q4_K_M prompt takes 4.29 s instead of 5.39 s (~20 %
+  less, same machine and session), KLD 0.00005 against the CPU. SiLU uses a 64-segment sigmoid table, since AIE2
+  has no fp32 vector multiplier. New builds `qm4_15360x2048_glu` and `qm6only_15360x2048_glu` in the `qgemm` set.
+
+### Changed
+
+- FFN gate and up weights are stored with their rows interleaved in blocks of 16 (`xdna1_llm.npu.qlinear`), so
+  the weight cache rebuilds on the first load. The `qgemm` cores changed, so every `qgemm` build must be rebuilt.
+
 ## [0.2.0] - 2026-11-21
 
 Prompts now read the 4-bit weights directly on the NPU instead of a bf16 copy of them. For Q4_K_M that means

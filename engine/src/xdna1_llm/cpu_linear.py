@@ -18,7 +18,7 @@ class CpuLinear:
         self.mats: dict[str, list] = {}
         self.npu_ms, self.calls = 0.0, 0
 
-    def register(self, name: str, w):
+    def register(self, name: str, w, glu: bool = False):  # glu ([gate, up] of an FFN) is a layout hint
         self.mats[name] = as_parts(w)
 
     def __call__(self, name: str, x: np.ndarray) -> np.ndarray:

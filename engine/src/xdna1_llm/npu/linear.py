@@ -63,7 +63,7 @@ class NpuLinear:
         self.npu_ms = 0.0
         self.calls = 0
 
-    def register(self, name: str, w):
+    def register(self, name: str, w, glu: bool = False):  # glu ([gate, up] of an FFN) is a layout hint
         """w: bf16 bits of shape (out, in) as stored in GGUF, a GGUF tensor of any type (dequantized to bf16
         here), or tensors whose rows are stacked; out must be a multiple of 1024."""
 

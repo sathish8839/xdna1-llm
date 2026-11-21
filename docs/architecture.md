@@ -8,6 +8,7 @@ engine/src/xdna1_llm/
   npu/device.py      pyxrt wrapper: device, kernels (hw contexts), buffers, zero-copy numpy views
   npu/qlinear.py     NpuQLinear: decode, Q4_K / Q6_K weights repacked once into device buffers, on the quantized GEMV
   npu/qgemm.py       NpuQGemm: prompts of up to 256 tokens on the W4A16 GEMM, reading NpuQLinear's buffers
+                     (the FFN fused: silu(gate) * up on the cores, left on the device for down)
   npu/linear.py      NpuLinear: the older bf16 prompt path, 1024-wide chunks on two fixed GEMM kernels
   cpu_linear.py      CpuLinear: the same interface in numpy, as a reference and fallback
   models/lfm3.py     LFM3: batched prefill and one-token decode over a shared state, on one or two linear backends

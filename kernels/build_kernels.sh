@@ -119,12 +119,15 @@ if [[ "$SET" == qgemm || "$SET" == all ]]; then
   for shape in 512x2048 2048x2048 2560x2048 3072x2048 6144x2048 15360x2048 2048x7680; do
     design "qm4_$shape" qgemm.py -Q 4 -N "${shape%x*}" -K "${shape#*x}"
   done
+  # FFN gate + up with silu(gate) * up on the cores (--glu), for the fused FFN (NpuQGemm.ffn)
+  design qm4_15360x2048_glu qgemm.py -Q 4 -N 15360 -K 2048 --glu
   for shape in 512x2048 2048x7680; do
     design "qm6_$shape" qgemm.py -Q 6 -N "${shape%x*}" -K "${shape#*x}"
   done
   for shape in 2048x2048 3072x2048 6144x2048 15360x2048 2048x7680; do
     design "qm6only_$shape" qgemm.py -Q 6 -N "${shape%x*}" -K "${shape#*x}" --geometry q6only
   done
+  design qm6only_15360x2048_glu qgemm.py -Q 6 -N 15360 -K 2048 --geometry q6only --glu
 fi
 if [[ "$SET" == bw || "$SET" == all ]]; then
   for lanes in 1 2 4 8; do

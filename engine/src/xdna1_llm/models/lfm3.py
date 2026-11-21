@@ -115,10 +115,10 @@ class LFM3:
         self.p: dict[str, np.ndarray] = {}
         t0 = time.perf_counter()
 
-        def register(name, wt):
-            lin.register(name, wt)
+        def register(name, wt, **kw):
+            lin.register(name, wt, **kw)
             if prefill_lin is not None:
-                prefill_lin.register(name, wt)
+                prefill_lin.register(name, wt, **kw)
 
         for i in range(self.n_layers):
             b = f"blk.{i}."
@@ -135,7 +135,7 @@ class LFM3:
                 self.p[b + "gate"] = w.f32(b + "attn_gate.weight")  # (H, D)
                 self.p[b + "q_norm"] = w.f32(b + "attn_q_norm.weight")
                 self.p[b + "k_norm"] = w.f32(b + "attn_k_norm.weight")
-            register(b + "gateup", [w.tensor(b + "ffn_gate.weight"), w.tensor(b + "ffn_up.weight")])
+            register(b + "gateup", [w.tensor(b + "ffn_gate.weight"), w.tensor(b + "ffn_up.weight")], glu=True)
             register(b + "down", w.tensor(b + "ffn_down.weight"))
         self.out_norm = w.f32("output_norm.weight")
         self.embd = w.tensor("token_embd.weight")  # (type, data); rows are tokens
@@ -227,11 +227,14 @@ class LFM3:
         h = h + rms(o, self.p[b + "post_attention_norm"])
         u = rms(h, self.p[b + "ffn_norm"])
         self.cpu_ms += (time.perf_counter() - t0) * 1e3
-        gu = self.cur(b + "gateup", u)
-        t0 = time.perf_counter()
-        act = silu(gu[:, : self.ff]) * gu[:, self.ff :]
-        self.cpu_ms += (time.perf_counter() - t0) * 1e3
-        f = self.cur(b + "down", act)
+        ffn = getattr(self.cur, "ffn", None)  # the prompt GEMM's fused FFN: act stays on the NPU
+        f = ffn(b + "gateup", b + "down", u) if ffn else None
+        if f is None:
+            gu = self.cur(b + "gateup", u)
+            t0 = time.perf_counter()
+            act = silu(gu[:, : self.ff]) * gu[:, self.ff :]
+            self.cpu_ms += (time.perf_counter() - t0) * 1e3
+            f = self.cur(b + "down", act)
         t0 = time.perf_counter()
         h = h + rms(f, self.p[b + "post_ffw_norm"])
         self.cpu_ms += (time.perf_counter() - t0) * 1e3
