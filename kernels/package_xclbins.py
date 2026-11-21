@@ -28,6 +28,10 @@ def resolve(o, call: Path):
 
 
 def package(calls: Path, kernels: Path, xclbinutil: str) -> int:
+    # Absolute paths throughout: xclbinutil runs inside each call folder.
+    calls, kernels = calls.resolve(), kernels.resolve()
+    if Path(xclbinutil).exists():
+        xclbinutil = str(Path(xclbinutil).resolve())
     done = 0
     for xclbin in sorted(kernels.glob("*.xclbin")):
         head = xclbin.read_bytes()[:64]
