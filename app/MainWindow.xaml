@@ -8,83 +8,155 @@
         <MicaBackdrop />
     </Window.SystemBackdrop>
 
-    <Grid>
-        <Grid.RowDefinitions>
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="*" />
-            <RowDefinition Height="Auto" />
-        </Grid.RowDefinitions>
-
-        <!-- Title bar (the content extends into it) with the engine status: dot, model and device, last speed. -->
-        <Grid x:Name="TitleBar" Padding="20,10,150,8" ColumnSpacing="10">
+    <!-- A Control at the root, so the theme's font, colours and resources inherit to everything below. -->
+    <UserControl x:Name="Root">
+        <UserControl.KeyboardAccelerators>
+            <KeyboardAccelerator Key="Escape" Invoked="OnEscape" />
+        </UserControl.KeyboardAccelerators>
+        <Grid x:Name="Frame">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="*" />
-                <ColumnDefinition Width="Auto" />
-                <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
-            <Ellipse x:Name="StatusDot" Width="10" Height="10" VerticalAlignment="Center"
-                     Fill="{ThemeResource TextFillColorDisabledBrush}" />
-            <TextBlock x:Name="StatusText" Grid.Column="1" VerticalAlignment="Center"
-                       TextTrimming="CharacterEllipsis" Text="Starting…" />
-            <Button x:Name="ModelButton" Grid.Column="2" Content="Model…"
-                    ToolTipService.ToolTip="Download a model or choose a GGUF file">
-                <Button.Flyout>
-                    <MenuFlyout x:Name="ModelMenu" Placement="BottomEdgeAlignedRight" Opening="OnModelMenuOpening" />
-                </Button.Flyout>
-            </Button>
-            <Button Grid.Column="3" Content="New chat" Click="OnNewChat" />
-        </Grid>
 
-        <InfoBar x:Name="Banner" Grid.Row="1" Margin="20,0,20,8" IsOpen="False" Severity="Error" />
-
-        <ScrollViewer x:Name="Scroller" Grid.Row="2" HorizontalScrollMode="Disabled">
-            <StackPanel x:Name="Messages" MaxWidth="860" Padding="24,8,24,24" Spacing="10" />
-        </ScrollViewer>
-        <TextBlock x:Name="EmptyHint" Grid.Row="2" HorizontalAlignment="Center" VerticalAlignment="Center"
-                   MaxWidth="420" TextAlignment="Center" TextWrapping="Wrap"
-                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
-                   Text="LFM3 runs on this PC's NPU. Nothing leaves the machine unless you turn on web search." />
-
-        <!-- First run: no model yet. -->
-        <StackPanel x:Name="SetupPanel" Grid.Row="2" Width="520" HorizontalAlignment="Center" VerticalAlignment="Center"
-                    Spacing="12" Visibility="Collapsed">
-            <TextBlock Style="{StaticResource SubtitleTextBlockStyle}" Text="Get a model" />
-            <TextBlock TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                       Text="xdna1 chat runs LiquidAI's LFM3-1.7B on this PC's NPU. Download it once from Hugging Face; after that, everything stays on this machine." />
-            <StackPanel x:Name="ModelChoices" Spacing="8" />
-            <TextBlock TextWrapping="Wrap" FontSize="12" Foreground="{ThemeResource TextFillColorTertiaryBrush}">
-                LFM3 is made by Liquid AI and licensed under the
-                <Hyperlink NavigateUri="https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/blob/main/LICENSE">LFM Open License v1.0</Hyperlink>.
-            </TextBlock>
-            <ProgressBar x:Name="DownloadBar" Maximum="1" Visibility="Collapsed" />
-            <Grid x:Name="DownloadRow" Visibility="Collapsed">
-                <TextBlock x:Name="DownloadText" VerticalAlignment="Center"
-                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                <Button x:Name="CancelDownloadButton" HorizontalAlignment="Right" Content="Cancel"
-                        Visibility="Collapsed" Click="OnCancelDownload" />
+            <!-- Silicon: the NPU panel. One tile lights up per streamed token. -->
+            <Grid x:Name="Sidebar" Width="248" Padding="18,14,18,18" RowSpacing="16" BorderThickness="0,0,1,0"
+                  Visibility="Collapsed">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                <StackPanel Orientation="Horizontal" Spacing="10">
+                    <Border x:Name="Chip" Width="20" Height="20" CornerRadius="5" BorderThickness="1.6"
+                            VerticalAlignment="Center">
+                        <Border x:Name="ChipCore" Width="6" Height="6" CornerRadius="1.5" />
+                    </Border>
+                    <TextBlock Text="xdna1" FontFamily="Bahnschrift" FontSize="18" FontWeight="SemiBold"
+                               VerticalAlignment="Center" />
+                </StackPanel>
+                <Border x:Name="NpuCard" Grid.Row="2" Padding="16" CornerRadius="14" BorderThickness="1">
+                    <StackPanel Spacing="14">
+                        <Grid>
+                            <TextBlock x:Name="NpuLabel" Text="NPU · 4×4 TILES" FontSize="11" CharacterSpacing="100" />
+                            <TextBlock x:Name="NpuState" HorizontalAlignment="Right" FontFamily="Cascadia Mono, Consolas"
+                                       FontSize="11" Text="idle" />
+                        </Grid>
+                        <Grid x:Name="Tiles" RowSpacing="6" ColumnSpacing="6">
+                            <Grid.RowDefinitions>
+                                <RowDefinition /><RowDefinition /><RowDefinition /><RowDefinition />
+                            </Grid.RowDefinitions>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition /><ColumnDefinition /><ColumnDefinition /><ColumnDefinition />
+                            </Grid.ColumnDefinitions>
+                        </Grid>
+                        <StackPanel Spacing="2">
+                            <TextBlock x:Name="SideRate" FontFamily="Cascadia Mono, Consolas" FontSize="28" Text="–" />
+                            <TextBlock x:Name="SideModel" FontSize="12" TextWrapping="Wrap" Text="tok/s" />
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
             </Grid>
-            <HyperlinkButton Padding="0" Content="Or use a GGUF file you already have…" Click="OnChooseModel" />
-        </StackPanel>
 
-        <!-- Composer -->
-        <Grid Grid.Row="3" MaxWidth="860" Padding="24,4,24,20" RowSpacing="8">
-            <Grid.RowDefinitions>
-                <RowDefinition Height="Auto" />
-                <RowDefinition Height="Auto" />
-            </Grid.RowDefinitions>
-            <TextBox x:Name="Input" AcceptsReturn="True" TextWrapping="Wrap" MaxHeight="180"
-                     PlaceholderText="Message (Enter to send, Shift+Enter for a new line)"
-                     PreviewKeyDown="OnInputKeyDown" />
-            <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="8">
-                <ToggleButton x:Name="ThinkToggle" Content="Thinking" Click="OnToggle"
-                              ToolTipService.ToolTip="Let the model reason before it answers (slower)" />
-                <ToggleButton x:Name="SearchToggle" Content="Web search" Click="OnToggle"
-                              ToolTipService.ToolTip="Let the model search the web with DuckDuckGo" />
-            </StackPanel>
-            <Button x:Name="SendButton" Grid.Row="1" HorizontalAlignment="Right" MinWidth="88"
-                    Style="{StaticResource AccentButtonStyle}" Content="Send" IsEnabled="False" Click="OnSend" />
+            <Grid Grid.Column="1">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <!-- Title bar (the content extends into it) with the engine status: dot, model and device, last speed. -->
+                <Grid x:Name="TitleBar" Padding="20,10,150,8" ColumnSpacing="10">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <Border x:Name="Brand" VerticalAlignment="Center" Visibility="Collapsed">
+                        <TextBlock x:Name="BrandText" Text="xdna1" />
+                    </Border>
+                    <Ellipse x:Name="StatusDot" Grid.Column="1" Width="10" Height="10" VerticalAlignment="Center" />
+                    <TextBlock x:Name="StatusText" Grid.Column="2" VerticalAlignment="Center"
+                               TextTrimming="CharacterEllipsis" Text="Starting…" />
+                    <Button Grid.Column="3" Content="Theme" ToolTipService.ToolTip="Change the app's look">
+                        <Button.Flyout>
+                            <MenuFlyout x:Name="ThemeMenu" Placement="BottomEdgeAlignedRight" />
+                        </Button.Flyout>
+                    </Button>
+                    <Button x:Name="ModelButton" Grid.Column="4" Content="Model…"
+                            ToolTipService.ToolTip="Download a model or choose a GGUF file">
+                        <Button.Flyout>
+                            <MenuFlyout x:Name="ModelMenu" Placement="BottomEdgeAlignedRight" Opening="OnModelMenuOpening" />
+                        </Button.Flyout>
+                    </Button>
+                    <Button Grid.Column="5" Content="New chat" Click="OnNewChat" />
+                </Grid>
+
+                <InfoBar x:Name="Banner" Grid.Row="1" Margin="20,0,20,8" IsOpen="False" Severity="Error" />
+
+                <ScrollViewer x:Name="Scroller" Grid.Row="3" HorizontalScrollMode="Disabled">
+                    <StackPanel x:Name="Messages" MaxWidth="860" Padding="24,8,24,24" Spacing="10" />
+                </ScrollViewer>
+                <TextBlock x:Name="EmptyHint" Grid.Row="3" HorizontalAlignment="Center" VerticalAlignment="Center"
+                           MaxWidth="420" TextAlignment="Center" TextWrapping="Wrap"
+                           Text="LFM3 runs on this PC's NPU. Nothing leaves the machine unless you turn on web search." />
+
+                <!-- First run: no model yet. -->
+                <StackPanel x:Name="SetupPanel" Grid.Row="3" Width="520" HorizontalAlignment="Center" VerticalAlignment="Center"
+                            Spacing="12" Visibility="Collapsed">
+                    <TextBlock Style="{StaticResource SubtitleTextBlockStyle}" Text="Get a model" />
+                    <TextBlock x:Name="SetupText" TextWrapping="Wrap"
+                               Text="xdna1 chat runs LiquidAI's LFM3-1.7B on this PC's NPU. Download it once from Hugging Face; after that, everything stays on this machine." />
+                    <StackPanel x:Name="ModelChoices" Spacing="8" />
+                    <TextBlock x:Name="LicenseText" TextWrapping="Wrap" FontSize="12">
+                        LFM3 is made by Liquid AI and licensed under the
+                        <Hyperlink NavigateUri="https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/blob/main/LICENSE">LFM Open License v1.0</Hyperlink>.
+                    </TextBlock>
+                    <ProgressBar x:Name="DownloadBar" Maximum="1" Visibility="Collapsed" />
+                    <Grid x:Name="DownloadRow" Visibility="Collapsed">
+                        <TextBlock x:Name="DownloadText" VerticalAlignment="Center" />
+                        <Button x:Name="CancelDownloadButton" HorizontalAlignment="Right" Content="Cancel"
+                                Visibility="Collapsed" Click="OnCancelDownload" />
+                    </Grid>
+                    <HyperlinkButton Padding="0" Content="Or use a GGUF file you already have…" Click="OnChooseModel" />
+                </StackPanel>
+
+                <!-- Composer: below the chat, or above it in Spotlight. -->
+                <Grid x:Name="Composer" Grid.Row="4" MaxWidth="860" Padding="24,4,24,20" RowSpacing="8">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <Grid ColumnSpacing="10">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <!-- Spotlight's ring, which turns while the model works. -->
+                        <Grid x:Name="Orb" Width="30" Height="30" VerticalAlignment="Center" Visibility="Collapsed">
+                            <Ellipse x:Name="OrbRing" Width="30" Height="30" StrokeThickness="3" />
+                            <Ellipse x:Name="OrbCore" Width="10" Height="10" />
+                        </Grid>
+                        <TextBlock x:Name="PromptGlyph" Text="›" FontSize="20" VerticalAlignment="Center" Visibility="Collapsed" />
+                        <TextBox x:Name="Input" Grid.Column="1" AcceptsReturn="True" TextWrapping="Wrap" MaxHeight="180"
+                                 PlaceholderText="Message (Enter to send, Shift+Enter for a new line)"
+                                 PreviewKeyDown="OnInputKeyDown" />
+                    </Grid>
+                    <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="8">
+                        <ToggleButton x:Name="ThinkToggle" Content="Thinking" Click="OnToggle"
+                                      ToolTipService.ToolTip="Let the model reason before it answers (slower)" />
+                        <ToggleButton x:Name="SearchToggle" Content="Web search" Click="OnToggle"
+                                      ToolTipService.ToolTip="Let the model search the web with DuckDuckGo" />
+                    </StackPanel>
+                    <Button x:Name="SendButton" Grid.Row="1" HorizontalAlignment="Right" MinWidth="88"
+                            Style="{StaticResource AccentButtonStyle}" Content="Send" IsEnabled="False" Click="OnSend" />
+                </Grid>
+            </Grid>
         </Grid>
-    </Grid>
+    </UserControl>
 </Window>

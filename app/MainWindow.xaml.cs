@@ -4,8 +4,10 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.UI;
 using Microsoft.UI.Input;
+using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Hosting;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 using Windows.Graphics;
@@ -28,23 +30,237 @@ public sealed partial class MainWindow : Window
     private CancellationTokenSource? downloading;
     private string ready = "";
 
+    private const float TileRest = 0.16f;
+    private readonly IntPtr hwnd;
+    private readonly List<UserView> users = [];
+    private readonly List<AssistantView> replies = [];
+    private readonly List<Border> tiles = [];
+    private readonly Random random = new();
+    private readonly Stopwatch live = new();
+    private Hotkey? hotkey;
+    private bool compact, applying;
+    private int liveTokens;
+    private long liveShown;
+
     public MainWindow()
     {
         InitializeComponent();
+        hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
         AppWindow.Resize(new SizeInt32(1000, 900));
         ExtendsContentIntoTitleBar = true;
         SetTitleBar(StatusText);
         ThinkToggle.IsChecked = settings.Thinking;
         SearchToggle.IsChecked = settings.WebSearch;
         BuildModelChoices();
+        BuildThemeMenu();
+        BuildSidebar();
+        EmptyHint.Foreground = LicenseText.Foreground = StatusDot.Fill = Ui.Tertiary;
+        SetupText.Foreground = DownloadText.Foreground = Ui.Secondary;
+        PromptGlyph.Foreground = OrbCore.Fill = Ui.Accent;
+        Root.ActualThemeChanged += (_, _) =>
+        {
+            if (!applying && Ui.Current.Colors == null)
+                Ui.SetPalette(Themes.NativePalette(Root.ActualTheme == ElementTheme.Dark));
+        };
+        ApplyTheme(Themes.Find(settings.Theme), save: false);
         Closed += (_, _) =>
         {
             downloading?.Cancel();
             starting?.Cancel();
             turn?.Cancel();
+            hotkey?.Dispose();
             engine.Dispose();
         };
         _ = StartEngineAsync();
+    }
+
+    private void BuildThemeMenu()
+    {
+        foreach (var t in Themes.All)
+        {
+            var item = new RadioMenuFlyoutItem { Text = t.Name, GroupName = "theme", Tag = t.Id };
+            item.Click += (_, _) => ApplyTheme(t);
+            ThemeMenu.Items.Add(item);
+        }
+    }
+
+    private void BuildSidebar()
+    {
+        Sidebar.Background = Ui.Surface;
+        Sidebar.BorderBrush = NpuCard.BorderBrush = Ui.Stroke;
+        NpuCard.Background = Ui.Raised;
+        Chip.BorderBrush = ChipCore.Background = Ui.Accent;
+        NpuLabel.Foreground = SideModel.Foreground = NpuState.Foreground = Ui.Secondary;
+        for (int i = 0; i < 16; i++)
+        {
+            var tile = new Border { Height = 36, CornerRadius = new CornerRadius(5), Background = Ui.Accent };
+            ElementCompositionPreview.GetElementVisual(tile).Opacity = TileRest;
+            Grid.SetRow(tile, i / 4);
+            Grid.SetColumn(tile, i % 4);
+            Tiles.Children.Add(tile);
+            tiles.Add(tile);
+        }
+    }
+
+    /// <summary>Switches the look: brushes, WinUI's control colours, fonts, layout and, for Spotlight, the window.</summary>
+    private void ApplyTheme(Theme t, bool save = true)
+    {
+        Ui.Current = t;
+        applying = true;
+        Root.Resources.MergedDictionaries.Clear();
+        if (t.Colors != null) Root.Resources.MergedDictionaries.Add(Ui.Overrides(t));
+        // Flipping the requested theme makes every {ThemeResource} look up again, now in the new dictionary.
+        bool dark = (t.Base == ElementTheme.Default ? Root.ActualTheme : t.Base) == ElementTheme.Dark;
+        Root.RequestedTheme = dark ? ElementTheme.Light : ElementTheme.Dark;
+        Root.RequestedTheme = t.Base;
+        applying = false;
+        Ui.SetPalette(t.Colors ?? Themes.NativePalette(Root.ActualTheme == ElementTheme.Dark));
+
+        SystemBackdrop = t.Backdrop switch
+        {
+            Backdrop.Mica => new MicaBackdrop(),
+            Backdrop.Acrylic => new DesktopAcrylicBackdrop(),
+            _ => null,
+        };
+        Frame.Background = t.Colors != null ? Ui.Background : null;  // a UserControl draws no background itself
+        if (t.Colors != null)
+        {
+            Root.Foreground = Ui.Text;
+            Root.FontFamily = new FontFamily(t.Body);
+        }
+        else
+        {
+            Root.ClearValue(Control.ForegroundProperty);
+            Root.ClearValue(Control.FontFamilyProperty);
+        }
+        SetCaptionColors(t.Colors);
+
+        static Visibility Show(bool on) => on ? Visibility.Visible : Visibility.Collapsed;
+        Sidebar.Visibility = Show(t.Sidebar);
+        PromptGlyph.Visibility = Show(t.Prompt);
+        Orb.Visibility = Show(t.Orb);
+        OrbRing.Stroke = new LinearGradientBrush
+        {
+            StartPoint = new(0, 0),
+            EndPoint = new(1, 1),
+            GradientStops =
+            {
+                new GradientStop { Color = Ui.Accent.Color, Offset = 0 },
+                new GradientStop { Color = Ui.AccentSoft.Color, Offset = 1 },
+            },
+        };
+        Grid.SetRow(Composer, t.ComposerTop ? 2 : 4);
+        Composer.Padding = t.ComposerTop ? new Thickness(24, 6, 24, 10) : new Thickness(24, 4, 24, 20);
+        Messages.MaxWidth = Composer.MaxWidth = t.Column;
+        bool rule = t.Sidebar || t.Prompt;  // Silicon and Console draw a line under the title bar
+        TitleBar.BorderBrush = Ui.Stroke;
+        TitleBar.BorderThickness = new Thickness(0, 0, 0, rule ? 1 : 0);
+        TitleBar.Margin = new Thickness(0, 0, 0, rule ? 8 : 0);
+
+        Brand.Visibility = Show(t.Id is "paper" or "console");
+        Brand.Background = t.Prompt ? Ui.Accent : null;
+        Brand.Padding = t.Prompt ? new Thickness(10, 2, 10, 2) : new Thickness(0, 0, 6, 0);
+        BrandText.Foreground = t.Prompt ? Ui.OnAccent : Ui.Text;
+        BrandText.FontFamily = new FontFamily(t.Prompt ? t.Body : "Sitka Heading, Georgia");
+        BrandText.FontSize = t.Prompt ? 14 : 21;
+        BrandText.FontWeight = t.Prompt ? Microsoft.UI.Text.FontWeights.Bold : Microsoft.UI.Text.FontWeights.SemiBold;
+
+        if (t.Underline)
+        {
+            Input.BorderThickness = new Thickness(0, 0, 0, t.Prompt ? 1 : 1.5);
+            Input.CornerRadius = new CornerRadius(0);
+        }
+        else
+        {
+            Input.ClearValue(Control.BorderThicknessProperty);
+            if (t.Colors == null) Input.ClearValue(Control.CornerRadiusProperty);
+            else Input.CornerRadius = new CornerRadius(t.Sidebar ? 14 : t.Radius);
+        }
+        if (t.Sidebar) Input.Padding = new Thickness(14, 10, 14, 10);
+        else Input.ClearValue(Control.PaddingProperty);
+        if (t.Compact) Input.FontSize = 18;
+        else Input.ClearValue(Control.FontSizeProperty);
+
+        foreach (var u in users) u.Apply(t);
+        foreach (var r in replies) r.Apply(t);
+        foreach (var item in ThemeMenu.Items.OfType<RadioMenuFlyoutItem>()) item.IsChecked = (string)item.Tag == t.Id;
+
+        if (t.Compact != compact) SetCompact(t.Compact);
+        if (save)
+        {
+            settings.Theme = t.Id;
+            settings.Save();
+        }
+    }
+
+    private void SetCaptionColors(Palette? c)
+    {
+        var bar = AppWindow.TitleBar;
+        bar.ButtonBackgroundColor = bar.ButtonInactiveBackgroundColor = Colors.Transparent;
+        bar.ButtonForegroundColor = bar.ButtonHoverForegroundColor = bar.ButtonPressedForegroundColor = c?.Text;
+        bar.ButtonHoverBackgroundColor = c?.Hover;
+        bar.ButtonPressedBackgroundColor = c?.Stroke;
+        bar.ButtonInactiveForegroundColor = c?.Tertiary;
+    }
+
+    /// <summary>Spotlight: a small window near the top of the screen, always on top, summoned with Alt+Space.</summary>
+    private void SetCompact(bool on)
+    {
+        compact = on;
+        ((OverlappedPresenter)AppWindow.Presenter).IsAlwaysOnTop = on;
+        var area = DisplayArea.GetFromWindowId(AppWindow.Id, DisplayAreaFallback.Primary).WorkArea;
+        double scale = on ? Hotkey.Scale(hwnd) : 1;  // the normal size is in pixels, like the startup size
+        int w = Math.Min((int)((on ? 760 : 1000) * scale), area.Width);
+        int h = Math.Min((int)((on ? 620 : 900) * scale), area.Height);
+        int y = on ? area.Y + area.Height / 8 : area.Y + (area.Height - h) / 2;
+        AppWindow.MoveAndResize(new RectInt32(area.X + (area.Width - w) / 2, y, w, h));
+        hotkey?.Dispose();
+        hotkey = on ? new Hotkey(hwnd, Hotkey.Alt, Hotkey.Space, OnSummon) : null;
+        if (hotkey is { Registered: false })
+            SetStatus(Status.Idle, StatusText.Text, "Alt+Space is taken by another app (PowerToys Run uses it), so it can't summon this window.");
+    }
+
+    private void OnSummon()
+    {
+        var presenter = (OverlappedPresenter)AppWindow.Presenter;
+        if (presenter.State != OverlappedPresenterState.Minimized && Hotkey.IsForeground(hwnd))
+        {
+            presenter.Minimize();
+            return;
+        }
+        presenter.Restore();
+        Activate();
+        Hotkey.Focus(hwnd);
+        Input.Focus(FocusState.Programmatic);
+    }
+
+    private void OnEscape(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs e)
+    {
+        if (!compact) return;
+        ((OverlappedPresenter)AppWindow.Presenter).Minimize();
+        e.Handled = true;
+    }
+
+    /// <summary>Per streamed token: Silicon lights a tile and shows the live speed.</summary>
+    private void OnToken()
+    {
+        if (liveTokens++ == 0) live.Restart();
+        if (!Ui.Current.Sidebar) return;
+        Motion.Pulse(tiles[random.Next(tiles.Count)], TileRest);
+        if (liveTokens > 4 && live.ElapsedMilliseconds - liveShown > 300)
+        {
+            liveShown = live.ElapsedMilliseconds;
+            SideRate.Text = $"{(liveTokens - 1) / live.Elapsed.TotalSeconds:0.0}";
+        }
+    }
+
+    private void SetBusy(bool busy)
+    {
+        liveTokens = 0;
+        liveShown = 0;
+        NpuState.Text = busy ? "live" : "idle";
+        NpuState.Foreground = busy ? Ui.AccentText : Ui.Secondary;
+        Motion.Spin(OrbRing, busy);
     }
 
     private async Task StartEngineAsync()
@@ -87,6 +303,7 @@ public sealed partial class MainWindow : Window
         }
         client = new ChatClient(engine.BaseUrl);
         ready = $"{engine.Model} on {engine.Device}";
+        SideModel.Text = $"tok/s · {engine.Model}";
         SetStatus(Status.Ready, $"{ready} · loaded in {sw.Elapsed.TotalSeconds:0} s");
         UpdateButtons();
         Input.Focus(FocusState.Programmatic);
@@ -104,11 +321,15 @@ public sealed partial class MainWindow : Window
         Input.Text = "";
         EmptyHint.Visibility = Visibility.Collapsed;
         history.Add(new JsonObject { ["role"] = "user", ["content"] = text });
-        Messages.Children.Add(MessageViews.User(text));
+        var user = new UserView(text);
+        users.Add(user);
+        Messages.Children.Add(user.Root);
+        Motion.Enter(user.Root);
         ScrollToEnd(force: true);
 
         var cts = turn = new CancellationTokenSource();
         UpdateButtons();
+        SetBusy(true);
         try
         {
             await RunTurnAsync(client, cts.Token);
@@ -125,6 +346,7 @@ public sealed partial class MainWindow : Window
             turn = null;
             cts.Dispose();
             UpdateButtons();
+            SetBusy(false);
         }
     }
 
@@ -133,6 +355,7 @@ public sealed partial class MainWindow : Window
     {
         bool think = ThinkToggle.IsChecked == true, search = SearchToggle.IsChecked == true;
         var view = new AssistantView();
+        replies.Add(view);
         Messages.Children.Add(view.Root);
         var speed = new Speed();
         try
@@ -185,7 +408,11 @@ public sealed partial class MainWindow : Window
                     continue;
                 var c = (string?)d["content"];
                 var r = (string?)d["reasoning_content"];
-                if (!string.IsNullOrEmpty(c) || !string.IsNullOrEmpty(r)) first ??= sw.Elapsed.TotalSeconds;
+                if (!string.IsNullOrEmpty(c) || !string.IsNullOrEmpty(r))
+                {
+                    first ??= sw.Elapsed.TotalSeconds;
+                    OnToken();
+                }
                 if (!string.IsNullOrEmpty(r)) view.SetReasoning(reasoning.Append(r).ToString(), done: false);
                 if (!string.IsNullOrEmpty(c)) view.SetContent(content.Append(c).ToString(), final: false);
                 if (d["tool_calls"] is JsonArray deltas) Accumulate(calls, deltas);
@@ -281,6 +508,7 @@ public sealed partial class MainWindow : Window
             parts.Add($"{rate:0.0} tok/s");
             parts.Add($"first token {speed.FirstToken:0.0} s");
             SetStatus(Status.Ready, $"{ready} · last reply {rate:0.0} tok/s");
+            SideRate.Text = $"{rate:0.0}";
         }
         if (stopped) parts.Add("stopped");
         if (parts.Count > 0) view.SetStats(string.Join(" · ", parts));
@@ -312,7 +540,7 @@ public sealed partial class MainWindow : Window
             {
                 Text = m.Note,
                 FontSize = 12,
-                Foreground = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"],
+                Foreground = Ui.Secondary,
             });
             var size = new TextBlock { Text = ModelDownload.Gb(m.Size), VerticalAlignment = VerticalAlignment.Center };
             Grid.SetColumn(size, 1);
@@ -419,6 +647,8 @@ public sealed partial class MainWindow : Window
     {
         turn?.Cancel();
         history.Clear();
+        users.Clear();
+        replies.Clear();
         Messages.Children.Clear();
         EmptyHint.Visibility = SetupPanel.Visibility == Visibility.Visible ? Visibility.Collapsed : Visibility.Visible;
         Input.Focus(FocusState.Programmatic);
@@ -433,6 +663,12 @@ public sealed partial class MainWindow : Window
 
     private void OnInputKeyDown(object sender, KeyRoutedEventArgs e)
     {
+        if (e.Key == VirtualKey.Escape && compact)
+        {
+            ((OverlappedPresenter)AppWindow.Presenter).Minimize();
+            e.Handled = true;
+            return;
+        }
         if (e.Key != VirtualKey.Enter) return;
         if (InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Shift).HasFlag(CoreVirtualKeyStates.Down)) return;
         e.Handled = true;
@@ -463,7 +699,7 @@ public sealed partial class MainWindow : Window
             Status.Ready => new SolidColorBrush(Colors.MediumSeaGreen),
             Status.Loading => new SolidColorBrush(Colors.Goldenrod),
             Status.Error => new SolidColorBrush(Colors.IndianRed),
-            _ => (Brush)Application.Current.Resources["TextFillColorDisabledBrush"],
+            _ => Ui.Tertiary,
         };
         Banner.IsOpen = detail != null;
         if (detail != null)

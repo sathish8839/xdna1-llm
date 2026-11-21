@@ -7,6 +7,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- App themes (Theme menu, saved): Windows (native, the default), Silicon (an NPU panel with a tile per streamed
+  token and the live speed), Paper (serif reading column), Console (monospace, streaming caret) and Spotlight (a
+  compact always-on-top window toggled with Alt+Space). Switching recolours the open chat in place. New
+  paragraphs animate in, and finished markdown blocks are no longer rebuilt on every streamed token.
 - Release workflow (`.github/workflows/release.yml`, on `v*` tags or by hand): builds the `engine` and `qgemv`
   kernels on Ubuntu with mlir-aie, runs their xclbinutil step on Windows with the XRT SDK (XRT has no Linux
   binary: `kernels/xclbinutil-defer` records the calls, `kernels/package_xclbins.py` runs them), builds the

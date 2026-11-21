@@ -6,38 +6,67 @@ using Microsoft.UI.Xaml.Media;
 
 namespace Xdna1Chat;
 
-public static class MessageViews
+/// <summary>A user message: a bubble, a serif heading (Paper) or a "›" prompt line (Console).</summary>
+public sealed class UserView
 {
-    public static UIElement User(string text) => new Border
-    {
-        HorizontalAlignment = HorizontalAlignment.Right,
-        MaxWidth = 620,
-        Margin = new Thickness(80, 4, 0, 4),
-        Padding = new Thickness(14, 9, 14, 9),
-        CornerRadius = new CornerRadius(12),
-        Background = Brush("AccentFillColorTertiaryBrush"),
-        Child = new TextBlock
-        {
-            Text = text,
-            TextWrapping = TextWrapping.Wrap,
-            IsTextSelectionEnabled = true,
-            Foreground = Brush("TextOnAccentFillColorPrimaryBrush"),
-        },
-    };
+    public Border Root { get; } = new();
+    private readonly TextBlock prefix = new() { Text = "›", Margin = new Thickness(0, 0, 10, 0), Foreground = Ui.Accent };
+    private readonly TextBlock text;
 
-    internal static Brush Brush(string key) => (Brush)Application.Current.Resources[key];
+    public UserView(string message)
+    {
+        text = new TextBlock { Text = message, TextWrapping = TextWrapping.Wrap, IsTextSelectionEnabled = true };
+        var row = new Grid();
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        Grid.SetColumn(text, 1);
+        row.Children.Add(prefix);
+        row.Children.Add(text);
+        Root.Child = row;
+        Apply(Ui.Current);
+    }
+
+    public void Apply(Theme t)
+    {
+        bool bubble = t.User == UserStyle.Bubble;
+        Root.HorizontalAlignment = bubble ? HorizontalAlignment.Right : HorizontalAlignment.Stretch;
+        Root.MaxWidth = bubble ? 620 : double.PositiveInfinity;
+        Root.Margin = t.User switch
+        {
+            UserStyle.Heading => new Thickness(0, 22, 0, 2),
+            UserStyle.Prompt => new Thickness(0, 12, 0, 0),
+            _ => new Thickness(80, 4, 0, 4),
+        };
+        Root.Padding = bubble ? new Thickness(14, 9, 14, 9) : new Thickness(0);
+        Root.CornerRadius = new CornerRadius(Math.Min(2 * t.Radius, 18));
+        Root.Background = bubble ? Ui.UserBubble : null;
+        text.Foreground = bubble ? Ui.UserText : Ui.Text;
+        prefix.Visibility = t.User == UserStyle.Prompt ? Visibility.Visible : Visibility.Collapsed;
+        if (t.User == UserStyle.Heading)
+        {
+            text.FontFamily = new FontFamily(t.Reading);
+            text.FontSize = 24;
+        }
+        else
+        {
+            text.ClearValue(TextBlock.FontFamilyProperty);
+            text.ClearValue(TextBlock.FontSizeProperty);
+        }
+    }
 }
 
 /// <summary>One assistant reply. A reply with web searches takes several model rounds; each round adds an
 /// optional collapsed "Thinking" section, its searches and its text. One line of speed stats closes the reply.</summary>
 public sealed class AssistantView
 {
-    public StackPanel Root { get; } = new() { Spacing = 8, Margin = new Thickness(0, 4, 40, 4) };
+    /// <summary>A Control, so the theme's reading font and size inherit to the rendered markdown.</summary>
+    public UserControl Root { get; } = new() { Margin = new Thickness(0, 4, 40, 4) };
 
+    private readonly StackPanel panel = new() { Spacing = 8 };
     private readonly TextBlock stats = new()
     {
         Style = (Style)Application.Current.Resources["CaptionTextBlockStyle"],
-        Foreground = MessageViews.Brush("TextFillColorTertiaryBrush"),
+        Foreground = Ui.Tertiary,
         Visibility = Visibility.Collapsed,
     };
     private readonly Stopwatch lastRender = Stopwatch.StartNew();
@@ -46,8 +75,23 @@ public sealed class AssistantView
     private TextBlock? thinkingHeader, thinkingText;
     private StackPanel? content;
     private string shown = "";
+    private InlineUIContainer? caret;
+    private Paragraph? caretHost;
 
-    public AssistantView() => Root.Children.Add(stats);
+    public AssistantView()
+    {
+        panel.Children.Add(stats);
+        Root.Content = panel;
+        Apply(Ui.Current);
+    }
+
+    public void Apply(Theme t)
+    {
+        Root.FontFamily = new FontFamily(t.Reading);
+        Root.FontSize = t.ReadingSize;
+        stats.FontFamily = new FontFamily(t.Body);
+        MarkdownView.SetCodeCorners(panel, new CornerRadius(t.Radius));
+    }
 
     public void BeginRound()
     {
@@ -67,7 +111,7 @@ public sealed class AssistantView
             {
                 TextWrapping = TextWrapping.Wrap,
                 IsTextSelectionEnabled = true,
-                Foreground = MessageViews.Brush("TextFillColorSecondaryBrush"),
+                Foreground = Ui.Secondary,
             };
             thinking = new Expander
             {
@@ -82,18 +126,45 @@ public sealed class AssistantView
         thinkingHeader!.Text = done ? $"Thought for {roundTime.Elapsed.TotalSeconds:0} s" : "Thinking…";
     }
 
-    /// <summary>Re-renders the markdown at most every 60 ms while streaming, and always when final.</summary>
+    /// <summary>Re-renders the markdown at most every 60 ms while streaming, and always when final. New blocks
+    /// animate in; Silicon and Console show a caret while text arrives.</summary>
     public void SetContent(string markdown, bool final)
     {
-        if (markdown == shown || (!final && lastRender.ElapsedMilliseconds < 60)) return;
+        if (markdown == shown)
+        {
+            if (final) RemoveCaret();
+            return;
+        }
+        if (!final && lastRender.ElapsedMilliseconds < 60) return;
         if (content == null)
         {
             content = new StackPanel { Spacing = 10 };
             Add(content);
         }
-        MarkdownView.Render(content, markdown);
+        RemoveCaret();
+        MarkdownView.Render(content, markdown, Motion.Enter);
+        if (!final) AddCaret();
         shown = markdown;
         lastRender.Restart();
+    }
+
+    private void AddCaret()
+    {
+        if (!Ui.Current.Caret || content?.Children.LastOrDefault() is not RichTextBlock rtb
+            || rtb.Blocks.LastOrDefault() is not Paragraph p)
+            return;
+        var block = new Border { Width = 8, Height = 16, Margin = new Thickness(3, 0, 0, -3), Background = Ui.Accent };
+        caret = new InlineUIContainer { Child = block };
+        p.Inlines.Add(caret);
+        caretHost = p;
+        Motion.Blink(block);
+    }
+
+    private void RemoveCaret()
+    {
+        if (caret != null) caretHost?.Inlines.Remove(caret);
+        caret = null;
+        caretHost = null;
     }
 
     public void SetStats(string text)
@@ -109,7 +180,11 @@ public sealed class AssistantView
         return note;
     }
 
-    private void Add(UIElement e) => Root.Children.Insert(Root.Children.Count - 1, e);  // stats stay last
+    private void Add(UIElement e)
+    {
+        panel.Children.Insert(panel.Children.Count - 1, e);  // stats stay last
+        Motion.Enter(e);
+    }
 }
 
 /// <summary>"Searching the web for …", then the result links.</summary>
@@ -128,7 +203,7 @@ public sealed class SearchNote
             IsTextSelectionEnabled = true,
             TextWrapping = TextWrapping.Wrap,
             FontSize = 13,
-            Foreground = MessageViews.Brush("TextFillColorSecondaryBrush"),
+            Foreground = Ui.Secondary,
         };
         Root.Blocks.Add(head);
     }
@@ -139,7 +214,7 @@ public sealed class SearchNote
         head.Inlines.Add(new Run { Text = $"Searched the web for “{query}”" });
         foreach (var r in results)
         {
-            var link = new Hyperlink { NavigateUri = new Uri(r.Url) };
+            var link = new Hyperlink { NavigateUri = new Uri(r.Url), Foreground = Ui.AccentText };
             link.Inlines.Add(new Run { Text = r.Title.Length > 0 ? r.Title : r.Url });
             head.Inlines.Add(new LineBreak());
             head.Inlines.Add(new Run { Text = "   " });

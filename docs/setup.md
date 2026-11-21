@@ -113,6 +113,17 @@ free localhost port and stops it when the window closes. Its settings live in `%
 and the engine's output in `engine.log` next to it. Web search sends the model's queries to DuckDuckGo; nothing
 else leaves the machine.
 
+**Theme** switches the look, and the choice is saved:
+
+* **Windows**: the native look (Mica, system accent, light or dark with the system).
+* **Silicon**: dark, with an NPU panel whose 16 tiles light up as tokens stream, and the live speed.
+* **Paper**: light and editorial, answers in a serif reading font in one column.
+* **Console**: monospace, amber on black, a caret while text streams.
+* **Spotlight**: a small acrylic window near the top of the screen, always on top. Alt+Space shows or hides it
+  from anywhere, Esc hides it. (PowerToys Run also uses Alt+Space; if it holds the key, the app says so.)
+
+Animations use the compositor and follow Windows' "Animation effects" setting.
+
 ### Portable build
 
 ```powershell

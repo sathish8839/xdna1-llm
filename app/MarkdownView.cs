@@ -23,34 +23,86 @@ public static class MarkdownView
 
     private static readonly FontFamily Mono = new("Cascadia Mono, Consolas");
 
-    public static void Render(StackPanel host, string markdown)
+    /// <summary>Marks code block borders, whose corners follow the theme.</summary>
+    public const string CodeTag = "code";
+
+    public static void SetCodeCorners(UIElement e, CornerRadius r)
     {
-        host.Children.Clear();
-        foreach (var block in Markdown.Parse(markdown, Pipeline))
-            host.Children.Add(Block(block, markdown));
+        if (e is Border b)
+        {
+            if (b.Tag is CodeTag) b.CornerRadius = r;
+            else if (b.Child != null) SetCodeCorners(b.Child, r);
+        }
+        else if (e is Panel p)
+            foreach (var c in p.Children) SetCodeCorners(c, r);
     }
+
+    /// <summary>Renders into <paramref name="host"/>, keeping the blocks whose source is unchanged since the last
+    /// call and updating a growing last paragraph in place; <paramref name="added"/> sees each new block.</summary>
+    public static void Render(StackPanel host, string markdown, Action<UIElement>? added = null)
+    {
+        var blocks = Markdown.Parse(markdown, Pipeline).ToList();
+        var keys = blocks.Select(b => b.GetType().Name + ":" + Source(b, markdown)).ToList();
+        var old = host.Tag as List<string> ?? [];
+        int same = 0;
+        while (same < old.Count && same < keys.Count && same < host.Children.Count && old[same] == keys[same]) same++;
+        bool inPlace = same < host.Children.Count && same < blocks.Count
+            && host.Children[same] is RichTextBlock { Tag: "p" } && blocks[same] is ParagraphBlock;
+        while (host.Children.Count > same + (inPlace ? 1 : 0)) host.Children.RemoveAt(host.Children.Count - 1);
+        for (int i = same; i < blocks.Count; i++)
+        {
+            if (i == same && inPlace)
+            {
+                Fill((RichTextBlock)host.Children[i], ((ParagraphBlock)blocks[i]).Inline);
+                continue;
+            }
+            var e = Block(blocks[i], markdown);
+            host.Children.Add(e);
+            if (i >= old.Count) added?.Invoke(e);
+        }
+        host.Tag = keys;
+    }
+
+    private static string Source(MdBlock b, string src) =>
+        src.Substring(b.Span.Start, Math.Max(0, Math.Min(b.Span.Length, src.Length - b.Span.Start)));
 
     private static UIElement Block(MdBlock b, string src) => b switch
     {
-        HeadingBlock h => Text(h.Inline, h.Level switch { 1 => 22, 2 => 19, 3 => 17, _ => 15 }, bold: true),
-        ParagraphBlock p => Text(p.Inline),
+        HeadingBlock h => Text(h.Inline, Ui.Current.ReadingSize + h.Level switch { 1 => 8, 2 => 5, 3 => 3, _ => 1 }, bold: true),
+        ParagraphBlock p => Paragraph(p.Inline),
         CodeBlock c => Code(c.Lines.ToString(), (c as FencedCodeBlock)?.Info),
         ListBlock l => List(l, src),
         QuoteBlock q => Quote(q, src),
-        ThematicBreakBlock => new Border { Height = 1, Margin = new Thickness(0, 6, 0, 6), Background = Brush("DividerStrokeColorDefaultBrush") },
+        ThematicBreakBlock => new Border { Height = 1, Margin = new Thickness(0, 6, 0, 6), Background = Ui.Stroke },
         Table t => TableView(t),
         LeafBlock leaf when leaf.Inline != null => Text(leaf.Inline),
-        _ => Plain(src.Substring(b.Span.Start, Math.Max(0, Math.Min(b.Span.Length, src.Length - b.Span.Start)))),
+        _ => Plain(Source(b, src)),
     };
 
-    private static RichTextBlock Text(ContainerInline? inlines, double size = 14, bool bold = false)
+    /// <summary>Body text at the inherited (theme's reading) size; a heading gets its own size.</summary>
+    private static RichTextBlock Text(ContainerInline? inlines, double? size = null, bool bold = false)
+    {
+        var rtb = new RichTextBlock { IsTextSelectionEnabled = true, TextWrapping = TextWrapping.Wrap };
+        if (size is { } s) rtb.FontSize = s;
+        Fill(rtb, inlines, bold);
+        return rtb;
+    }
+
+    /// <summary>A paragraph, tagged so a re-render can update it in place.</summary>
+    private static RichTextBlock Paragraph(ContainerInline? inlines)
+    {
+        var rtb = Text(inlines);
+        rtb.Tag = "p";
+        return rtb;
+    }
+
+    private static void Fill(RichTextBlock rtb, ContainerInline? inlines, bool bold = false)
     {
         var p = new Paragraph();
         if (bold) p.FontWeight = FontWeights.SemiBold;
         if (inlines != null) AddInlines(p.Inlines, inlines);
-        var rtb = new RichTextBlock { IsTextSelectionEnabled = true, TextWrapping = TextWrapping.Wrap, FontSize = size };
+        rtb.Blocks.Clear();
         rtb.Blocks.Add(p);
-        return rtb;
     }
 
     private static TextBlock Plain(string text) =>
@@ -102,7 +154,7 @@ public static class MarkdownView
 
     private static XamlInline Link(string? url, Action<Hyperlink> fill)
     {
-        var h = new Hyperlink();
+        var h = new Hyperlink { Foreground = Ui.AccentText };
         if (Uri.TryCreate(url, UriKind.Absolute, out var u) && u.Scheme is "http" or "https" or "mailto")
             h.NavigateUri = u;
         fill(h);
@@ -119,7 +171,7 @@ public static class MarkdownView
         {
             Text = language ?? "",
             FontSize = 12,
-            Foreground = Brush("TextFillColorSecondaryBrush"),
+            Foreground = Ui.Secondary,
             VerticalAlignment = VerticalAlignment.Center,
         });
         var copy = new Button
@@ -154,12 +206,13 @@ public static class MarkdownView
         });
         return new Border
         {
-            Background = Brush("CardBackgroundFillColorSecondaryBrush"),
-            BorderBrush = Brush("CardStrokeColorDefaultBrush"),
+            Background = Ui.Code,
+            BorderBrush = Ui.Stroke,
             BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(6),
+            CornerRadius = new CornerRadius(Ui.Current.Radius),
             Padding = new Thickness(12, 4, 6, 8),
             Child = body,
+            Tag = CodeTag,
         };
     }
 
@@ -189,7 +242,7 @@ public static class MarkdownView
         foreach (var b in quote) body.Children.Add(Block(b, src));
         return new Border
         {
-            BorderBrush = Brush("AccentFillColorDefaultBrush"),
+            BorderBrush = Ui.Accent,
             BorderThickness = new Thickness(3, 0, 0, 0),
             Padding = new Thickness(12, 2, 0, 2),
             Child = body,
@@ -224,6 +277,4 @@ public static class MarkdownView
             VerticalScrollMode = ScrollMode.Disabled,
         };
     }
-
-    private static Brush Brush(string key) => (Brush)Application.Current.Resources[key];
 }

@@ -24,7 +24,9 @@ app/                 WinUI 3 chat app (C#, unpackaged, Windows App SDK copied ne
   EngineHost.cs      starts `python -m xdna1_llm.server` on a free localhost port, in a kill-on-close job object
   ChatClient.cs      streams /v1/chat/completions
   WebSearch.cs       the web_search tool: DuckDuckGo's HTML results, run by the app, never by the engine
-  MarkdownView.cs    markdown (Markdig) to native WinUI text, code blocks and tables
+  MarkdownView.cs    markdown (Markdig) to native WinUI text, code blocks and tables; keeps finished blocks
+  Themes.cs          the five looks: shared brushes recoloured in place, WinUI control colours, composition animations
+  Hotkey.cs          Spotlight's system-wide Alt+Space
   MainWindow.xaml    status bar, chat, composer with the thinking and web search toggles
 kernels/build_kernels.sh   builds the xclbins from mlir-aie's whole_array GEMM example
 ```

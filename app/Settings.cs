@@ -9,6 +9,7 @@ public sealed class Settings
     public string? Python { get; set; }
     public bool Thinking { get; set; }
     public bool WebSearch { get; set; }
+    public string Theme { get; set; } = "native";
 
     private static string FilePath => Path.Combine(EngineHost.DataDir, "app.json");
     private static readonly JsonSerializerOptions Json = new() { WriteIndented = true };
