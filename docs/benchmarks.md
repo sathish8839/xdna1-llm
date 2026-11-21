@@ -171,7 +171,8 @@ on it. Two contexts in all. Before it, prompts ran on the bf16 GEMM (section 4) 
 |---|---|---|---|---|
 | one token at a time on the GEMV (`--no-gemm-prompt`) | ~47 s (16 tok/s) | — | 8 s | 2.6 GB |
 | bf16 GEMM, bf16 weight copy | 5.9 s (138 tok/s) | 3.47 s | 30.8 s | 5.4 GB |
-| **W4A16 GEMM** | **4.6 s (178 tok/s)** | **2.14 s** | **8.2 s** | **2.6 GB** |
+| W4A16 GEMM | 4.6 s (178 tok/s) | 2.14 s | 8.2 s | 2.6 GB |
+| **W4A16 GEMM, threaded bf16 conversion, outputs not copied** | **~3.9 s (~209 tok/s)** | | **8.2 s** | **2.6 GB** |
 
 * Q6_K, 647-token prompt: 4.6 s (141 tok/s) on the bf16 GEMM, 3.4 s (192 tok/s) on the W4A16 GEMM.
 * Same numerics as the bf16 GEMM: both multiply bf16 activations by the weights dequantized and rounded to bf16
@@ -181,8 +182,11 @@ on it. Two contexts in all. Before it, prompts ran on the bf16 GEMM (section 4) 
 * Kernel alone, M = 256: 2.1–2.3 TFLOP/s on LFM3's large shapes (15360×2048 in 7.6 ms, 2048×7680 in 3.6–3.8 ms),
   1.5 TFLOP/s on 512×2048; the bf16 GEMM runs 15360×2048 as 15 chunks in ~13.6 ms. The core spends about as
   long making B from the 4-bit tiles as in the `mmul`, and reads 4.5–6.6 bits per weight instead of 16.
-* Half of the GEMM time is now host work around each call: converting the activations to bf16 (1.5–6 ms per
-  call) and copying the output (up to 4 ms for 15360 columns). The CPU ops between calls take the other 2.3 s.
+* Host work around each call: converting the activations to bf16 took 1.5–3 ms per call on one thread (~2.7×
+  faster on 4), and copying the output up to 2.5 ms (15360 columns). The engine now converts on 4 threads and
+  returns a single-matrix output as a view of its device buffer (two buffer sets in turn, so a result outlives
+  the next call): 4.33 → 3.91 s for the same prompt, median of 5 alternating runs. Of the remaining ~3.9 s,
+  the NPU takes 1.3 s, host work around the calls ~0.4 s and the CPU ops between calls ~2.1 s (M7).
 * Chunks shorter than 32 tokens stay on the GEMV: the GEMM always computes 256 rows, which takes about as long
   as ~25 single-token steps.
 * The weight cache now holds only the GEMV tiles, 1.2 GB instead of 3.9 GB. Loading Q4_K_M through

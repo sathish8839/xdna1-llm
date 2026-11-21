@@ -64,7 +64,7 @@ These come from measurements in [benchmarks.md](benchmarks.md) (the last one is 
 * q/k/v as one call, completion polling instead of a sleeping wait: done, 11–12 → ~14 tok/s.
 * Faster 6-bit kernel: done (Q6_K GEMVs 15–25 % faster, Q4_K ~10 %; all-Q6_K models stream no padding).
 * Batched prompt: done. Prompt chunks of 32–256 tokens run on the W4A16 GEMM over the decode weights, then
-  decode continues from the same state: ~180 tok/s instead of 16, KLD 0.00004 against the CPU
+  decode continues from the same state: ~200 tok/s instead of 16, KLD 0.00004 against the CPU
   ([benchmarks 3d](benchmarks.md#3d-batched-prompt)).
 * Next: the CPU ops between calls on the NPU (M7) so a layer needs fewer round trips.
   The GEMV loop still waits on latency more than on the MAC unit (broadcasting x is the largest remaining cost);
@@ -85,9 +85,9 @@ GGUF Q4_K_M mixes **Q4_K** (most tensors) and **Q6_K** (for LFM3-1.7B: `token_em
    lossless; tested against `gguf.quants`.
 2. **W4A16 kernel:** done (`kernels/designs/qgemm.py`). The core unpacks the GEMV's tiles to bf16 in the vector
    unit (group scale and min applied, rounded to nearest even) and runs bf16 `mmul`, reading the same device
-   buffers as decode. It replaced the bf16 weight copy: 2.8 GB less RAM, load 31 → 8 s, prompt 138 → 178 tok/s
-   ([benchmarks 3d](benchmarks.md#3d-batched-prompt)). Next: the host work around each call (bf16 conversion,
-   output copy), now half of the GEMM time.
+   buffers as decode. It replaced the bf16 weight copy: 2.8 GB less RAM, load 31 → 8 s, prompt 138 → ~209 tok/s
+   with threaded bf16 conversion and uncopied outputs ([benchmarks 3d](benchmarks.md#3d-batched-prompt)). The
+   CPU ops between the calls are now more than half of a prompt (M7).
 3. **Optional W4A8:** AIE2's int4 × int8 MAC modes with per-token int8 activations. Faster, slightly different
    numerics; benchmark against (2).
 4. Q6_K: same structure with a 6-bit unpack. Done for decode (`kernels/designs/qgemv.cc`).

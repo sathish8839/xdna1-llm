@@ -9,9 +9,10 @@ All notable changes to this project are documented here. The format follows
 
 - W4A16 prompt GEMM (`kernels/designs/qgemm.py`, `xdna1_llm.npu.qgemm`): prompts read the Q4_K / Q6_K weights
   the decode GEMV already holds on the device, so the bf16 weight copy is gone. Q4_K_M: 2.8 GB less RAM, load
-  31 → 8 s, prompt 138 → 178 tok/s (Q6_K 141 → 192 tok/s), same output (KLD 0.00004 against the CPU). New
+  31 → 8 s, prompt 138 → ~209 tok/s (Q6_K 141 → 192 tok/s), same output (KLD 0.00004 against the CPU). New
   kernel set `qgemm` in `kernels/build_kernels.sh`; releases ship `qgemv` + `qgemm`. The bf16 GEMM stays as the
-  fallback when `qgemm` is not built.
+  fallback when `qgemm` is not built. The prompt GEMM converts activations to bf16 on 4 threads and returns
+  outputs without copying them (two output buffer sets in turn).
 
 ### Changed
 
