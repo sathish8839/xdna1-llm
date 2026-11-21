@@ -5,6 +5,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-21
+
+Faster on both ends, with the same output. The FFN's SwiGLU now runs on the NPU cores for prompts and for
+generation, and the CPU work between the NPU calls is rewritten. For Q4_K_M, generation goes from ~12.7 to
+~15–17 tok/s, an 820-token prompt from ~3.3 s to ~2.7 s, and generation after a 4K-token prompt from ~10 to
+~13–14 tok/s; KLD against the CPU is unchanged. Kernels built for v0.2.0 do not work with this version; the
+installer brings new ones, and the weight cache rebuilds itself on the first load.
+
 ### Added
 
 - Fused FFN for prompts (`NpuQGemm.ffn`): the gate + up GEMM computes silu(gate) · up on the NPU cores and
@@ -153,6 +161,7 @@ OpenAI-compatible local server. Tested on one laptop (Ryzen 7 250) with NPU driv
 - `eval_quality.py` started every chunk with the text's first token instead of BOS (llama.cpp adds no BOS for
   LFM3); accuracy numbers re-measured.
 
-[Unreleased]: https://github.com/sathish8839/xdna1-llm/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/sathish8839/xdna1-llm/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/sathish8839/xdna1-llm/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/sathish8839/xdna1-llm/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/sathish8839/xdna1-llm/releases/tag/v0.1.0
