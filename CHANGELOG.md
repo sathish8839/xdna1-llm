@@ -17,6 +17,10 @@ All notable changes to this project are documented here. The format follows
 
 - Prompts run layer by layer (every chunk through a layer before the next layer), so the NPU switches between
   the GEMM and attention contexts twice per attention layer instead of twice per chunk.
+- The CPU work of a prompt overlaps the NPU: the prompt GEMM runs while the host works (`submit` / `collect`),
+  two chunks are in flight, and the CPU ops write into reused scratch arrays instead of fresh ones (on Windows
+  a fresh multi-MB array costs ~0.3 ms in page faults). Q4_K_M prompts: 4K tokens 11.1 → 9.2 s
+  (370 → 447 tok/s), 1K tokens 2.76 → 2.30 s; the output is identical.
 
 ## [0.3.0] - 2026-11-21
 

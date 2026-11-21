@@ -113,9 +113,13 @@ def test_npu_qgemm_matches_bf16_weights(npu, kinds, geometry):
         y = gemm("w", x)
         assert y.shape == (T, n * len(kinds))
         np.testing.assert_allclose(y, ref, rtol=0, atol=1e-3 * np.abs(ref).max())
-    kept = y.copy()  # a result stays valid through the next call (two output buffer sets, used in turn)
-    gemm("w", rng.standard_normal((T, k)).astype(np.float32))
-    np.testing.assert_array_equal(y, kept)
+    kept = y.copy()
+    xs = [rng.standard_normal((T, k)).astype(np.float32) for _ in range(2)]
+    ps = [gemm.submit("w", xi) for xi in xs]  # two calls in flight
+    outs = [gemm.collect(p).copy() for p in ps]
+    np.testing.assert_array_equal(y, kept)  # a result stays valid through two more calls (three buffer sets)
+    for xi, yi in zip(xs, outs, strict=True):
+        np.testing.assert_array_equal(yi, gemm("w", xi))
 
 
 @pytest.mark.parametrize(("kinds", "geometry"), [(("Q4_K", "Q6_K"), "unified"), (("Q6_K", "Q6_K"), "q6only")])

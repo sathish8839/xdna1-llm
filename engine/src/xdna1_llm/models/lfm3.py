@@ -18,10 +18,18 @@ Two linear backends: `lin` serves decode (and prefill when there is no other), `
 prompt chunks of at least PREFILL_MIN tokens. For a Q4_K_M / Q6_K model on the NPU, `lin` is the quantized GEMV
 (one token per call) and `prefill_lin` the W4A16 GEMM, which reads the GEMV's weights (or, if it is not built, the
 bf16 GEMM, which makes a bf16 copy of every linear weight at load).
+
+The layer code is written as generators: each yields the linear-layer calls it needs, ("lin", name, x) or ("ffn",
+gate + up, down, x), and gets their results back. Decode runs one straight through (`_run`). A prompt runs one per
+chunk (`_drive`) and keeps two chunks' calls in flight, so while the NPU computes one chunk's GEMM the host does the
+other chunk's CPU ops; a backend that cannot overlap (no `submit`) is just called. The CPU ops of a prompt chunk
+write into scratch arrays reused from layer to layer (`Work`): on Windows a fresh multi-MB numpy array costs
+~0.3 ms in page faults, more than most of the ops on it.
 """
 
 from __future__ import annotations
 
+import collections
 import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -34,6 +42,7 @@ EPS, LCONV, SWA_WINDOW = 1e-5, 7, 256
 CHUNK = 256  # prefill rows per pass (the bf16 GEMM's tile)
 PREFILL_MIN = 32  # shorter prompt chunks run on `lin`: the GEMM always computes 256 rows
 THREADS = 8  # prompt attention: one task per query head (numpy releases the GIL); 8 beat 4 and 16 on 8 cores
+DEPTH = 2  # prompt chunks with a linear-layer call in flight
 _pool = None
 
 
@@ -44,10 +53,10 @@ def _threads():
     return _pool
 
 
-def rms(x, w):
+def rms(x, w, out=None):
     x = x.astype(np.float32, copy=False)
     inv = 1.0 / np.sqrt(np.einsum("...i,...i->...", x, x) / np.float32(x.shape[-1]) + np.float32(EPS))
-    out = x * inv[..., None].astype(np.float32)
+    out = np.multiply(x, inv[..., None].astype(np.float32), out=out)
     out *= w
     return out
 
@@ -66,10 +75,29 @@ def rope_tables(T, head_dim, base, rot_pairs, start=0):
     return np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
 
 
-def apply_rope(x, cos, sin):  # x (T, H, D)
+def apply_rope(x, cos, sin, out=None, tmp=None):
+    """x (T, H, D) rotated: x * cos + rotate_half(x) * sin, into out; tmp: (T, H, D / 2) scratch."""
     half = x.shape[-1] // 2
-    rot = np.concatenate([-x[..., half:], x[..., :half]], axis=-1)
-    return x * cos[:, None, :] + rot * sin[:, None, :]
+    out = np.multiply(x, cos[:, None, :], out=out)
+    tmp = np.multiply(x[..., half:], sin[:, None, :half], out=tmp)
+    np.subtract(out[..., :half], tmp, out=out[..., :half])
+    np.multiply(x[..., :half], sin[:, None, half:], out=tmp)
+    np.add(out[..., half:], tmp, out=out[..., half:])
+    return out
+
+
+class Work:
+    """Scratch arrays of one prompt chunk in flight, by name, reused from call to call (grown when too small)."""
+
+    def __init__(self):
+        self.bufs = {}
+
+    def __call__(self, name: str, *shape: int) -> np.ndarray:
+        n = int(np.prod(shape))
+        a = self.bufs.get(name)
+        if a is None or a.size < n:
+            a = self.bufs[name] = np.empty(n, np.float32)
+        return a[:n].reshape(shape)
 
 
 class State:
@@ -116,7 +144,8 @@ class LFM3:
         if w.arch != "lfm3":
             raise ValueError(f"expected an lfm3 GGUF, got {w.arch!r}")
         self.w, self.lin, self.prefill_lin, self.attn = w, lin, prefill_lin, attn
-        self.cur = lin  # the backend the running pass uses
+        self.work = [Work() for _ in range(DEPTH + 1)]  # DEPTH for prompt chunks, the last for decode
+        self.ropes = {}  # (kind, T, start) -> rope tables, for the running prompt
         a = "lfm3."
         self.n_layers = int(w.scalar(a + "block_count"))
         self.d = int(w.scalar(a + "embedding_length"))
@@ -187,45 +216,155 @@ class LFM3:
         return logits
 
     def rope(self, kind, T, start=0):
+        key = (kind, T, start)
+        if key not in self.ropes:  # every attention layer of a kind uses the same tables
+            self.ropes[key] = self._rope(kind, T, start)
+        return self.ropes[key]
+
+    def _rope(self, kind, T, start):
         if kind == "full":
             return rope_tables(T, self.hd, self.base_full, self.rot_pairs_full, start)
         return rope_tables(T, self.hd, self.base_swa, self.hd // 2, start)
 
-    # ---- prefill
-    def _conv(self, b, i, u, st):
-        P = self.cur(b + "in_proj", u)
+    # ---- linear-layer calls
+    @staticmethod
+    def _submit(lin, req):
+        """Start the call req on backend lin; returns a function that waits for its result."""
+        if req[0] == "ffn":  # the fused FFN, if the backend has one; else its result is None
+            _, gateup, down, x = req
+            if hasattr(lin, "submit_ffn"):
+                p = lin.submit_ffn(gateup, down, x)
+                return (lambda: None) if p is None else partial(lin.collect, p)
+            ffn = getattr(lin, "ffn", None)
+            return partial(ffn, gateup, down, x) if ffn else (lambda: None)
+        _, name, x = req
+        if hasattr(lin, "submit"):
+            return partial(lin.collect, lin.submit(name, x))
+        return partial(lin, name, x)  # called when its result is wanted
+
+    def _run(self, gen, lin):
+        """Run one layer generator to the end on backend lin; returns its return value."""
+        v = None
+        while True:
+            try:
+                req = gen.send(v)
+            except StopIteration as e:
+                return e.value
+            v = self._submit(lin, req)()
+
+    def _drive(self, jobs):
+        """Run jobs [(make, backend)], in order, DEPTH at a time: make(work=...) returns a layer generator, work being
+        a scratch set (Work) it has to itself until it ends. The call a generator yields is started, and its result
+        waited for only after the others have run on to their next calls; calls finish in the order they started.
+        Jobs on different backends do not overlap (the device would switch between their contexts on every call).
+        Returns the generators' return values."""
+        out = [None] * len(jobs)
+        flight = collections.deque()  # (job, generator, its scratch, result), oldest first
+        free = self.work[:DEPTH]
+
+        def advance(j, gen, work, v):
+            try:
+                req = gen.send(v)
+            except StopIteration as e:
+                out[j] = e.value
+                free.append(work)
+                return
+            flight.append((j, gen, work, self._submit(jobs[j][1], req)))
+
+        k = 0
+        while True:
+            while k < len(jobs) and len(flight) < DEPTH and all(jobs[f[0]][1] is jobs[k][1] for f in flight):
+                work = free.pop()
+                k += 1
+                advance(k - 1, jobs[k - 1][0](work=work), work, None)
+            if not flight:
+                return out
+            j, gen, work, result = flight.popleft()
+            advance(j, gen, work, result())
+
+    # ---- layer generators: h, a chunk's rows of the residual stream, is updated in place; work, its scratch
+    def _mix_in(self, b, h, work):
         t0 = time.perf_counter()
-        d = self.d
+        u = rms(h, self.p[b + "attn_norm"], out=work("u", *h.shape))
+        self.cpu_ms += (time.perf_counter() - t0) * 1e3
+        return u
+
+    def _mix_out(self, b, h, o, work):
+        """The rest of a layer after its token mixer's output o: norm and residual, then the SwiGLU FFN."""
+        t0 = time.perf_counter()
+        t = work("t", *h.shape)
+        h += rms(o, self.p[b + "post_attention_norm"], out=t)
+        u = rms(h, self.p[b + "ffn_norm"], out=work("u", *h.shape))  # free once submitted (copied to the device)
+        self.cpu_ms += (time.perf_counter() - t0) * 1e3
+        f = yield ("ffn", b + "gateup", b + "down", u)  # fused (prompt GEMM, decode GEMV): act stays on the NPU
+        if f is None:
+            gu = yield ("lin", b + "gateup", u)
+            t0 = time.perf_counter()
+            act = silu(gu[:, : self.ff]) * gu[:, self.ff :]
+            self.cpu_ms += (time.perf_counter() - t0) * 1e3
+            f = yield ("lin", b + "down", act)
+        t0 = time.perf_counter()
+        h += rms(f, self.p[b + "post_ffw_norm"], out=t)
+        self.cpu_ms += (time.perf_counter() - t0) * 1e3
+        return h
+
+    def _short_conv(self, b, P, tail, work=None):
+        """The short conv between in_proj (P: (T, 3 d)) and out_proj, after the conv inputs tail (6, d) of the
+        tokens before; returns (out_proj's input, the last 6 conv inputs)."""
+        t0 = time.perf_counter()
+        work = work or Work()
+        d, T = self.d, P.shape[0]
         Bg, Cg, X = P[:, :d], P[:, d : 2 * d], P[:, 2 * d :]
-        z = Bg * X
+        zp = work("zp", LCONV - 1 + T, d)  # the previous 6 inputs, then this chunk's
+        zp[: LCONV - 1] = tail
+        np.multiply(Bg, X, out=zp[LCONV - 1 :])
         wc = self.p[b + "conv"]
-        zp = np.concatenate([st.conv[i], z], 0)  # the previous 6 inputs, then this chunk's
-        T = z.shape[0]
-        y, tmp = zp[:T] * wc[:, 0], np.empty_like(z)
+        y, tmp = np.multiply(zp[:T], wc[:, 0], out=work("y", T, d)), work("t", T, d)
         for k in range(1, LCONV):
             np.multiply(zp[k : k + T], wc[:, k], out=tmp)
             y += tmp
-        st.conv[i] = zp[-(LCONV - 1) :]
-        g = Cg * y
+        g = np.multiply(Cg, y, out=work("u", T, d))
         self.cpu_ms += (time.perf_counter() - t0) * 1e3
-        return self.cur(b + "out_proj", g)
+        return g, zp[-(LCONV - 1) :].copy()
 
-    def _qkv(self, b, i, u, kind, st, p0):
-        """q/k/v of a chunk at p0: writes its keys and values into st; returns q (scaled by 1 / sqrt(hd)) and
-        the per-head output gate."""
-        T, nh, hd, nkv = u.shape[0], self.nh, self.hd, self.kv_heads[i]
-        qkv = self.cur(b + "qkv", u)
+    def _conv_layer(self, b, h, tails, j, work):
+        """A conv layer on chunk j's rows h: its conv reads the inputs tails[j] before it and sets tails[j + 1]
+        (chunk j - 1 has: _drive returns results in the order the calls started)."""
+        P = yield ("lin", b + "in_proj", self._mix_in(b, h, work))
+        g, tails[j + 1] = self._short_conv(b, P, tails[j], work)
+        o = yield ("lin", b + "out_proj", g)
+        return (yield from self._mix_out(b, h, o, work))
+
+    def _qkv(self, b, i, h, kind, st, p0, q_out, work):
+        """q/k/v of a chunk at p0 (rows h): writes its keys and values into st and q (scaled by 1 / sqrt(hd)) into
+        q_out (T, nh, hd); returns the per-head output gate."""
+        u = self._mix_in(b, h, work)
+        qkv = yield ("lin", b + "qkv", u)
         t0 = time.perf_counter()
-        q = rms(qkv[:, : nh * hd].reshape(T, nh, hd), self.p[b + "q_norm"])
-        k = rms(qkv[:, nh * hd : (nh + nkv) * hd].reshape(T, nkv, hd), self.p[b + "k_norm"])
+        T, nh, hd, nkv = u.shape[0], self.nh, self.hd, self.kv_heads[i]
         cos, sin = self.rope(kind, T, p0)
-        q = apply_rope(q, cos, sin) * np.float32(1.0 / np.sqrt(hd))
-        st.k[i][:, p0 : p0 + T] = apply_rope(k, cos, sin).transpose(1, 0, 2)
+        tmp = work("rope", T, nh, hd // 2)
+        q = rms(qkv[:, : nh * hd].reshape(T, nh, hd), self.p[b + "q_norm"], out=work("t", T, nh, hd))
+        apply_rope(q, cos, sin, q_out, tmp)
+        q_out *= np.float32(1.0 / np.sqrt(hd))
+        k = rms(qkv[:, nh * hd : (nh + nkv) * hd].reshape(T, nkv, hd), self.p[b + "k_norm"], out=work("k", T, nkv, hd))
+        k = apply_rope(k, cos, sin, work("t", T, nkv, hd), tmp[:, :nkv])
+        st.k[i][:, p0 : p0 + T] = k.transpose(1, 0, 2)
         st.v[i][:, p0 : p0 + T] = qkv[:, (nh + nkv) * hd :].reshape(T, nkv, hd).transpose(1, 0, 2)
         gate = 1.0 / (1.0 + np.exp(-(u @ self.p[b + "gate"].T)))
         self.cpu_ms += (time.perf_counter() - t0) * 1e3
-        return q, gate
+        return gate
 
+    def _attn_out(self, b, h, o, gate, work):
+        """The rest of an attention layer: o_proj of the attention output o (T, nh, hd) times its per-head gate."""
+        t0 = time.perf_counter()
+        T = o.shape[0]
+        g = np.multiply(o, gate[:, :, None], out=work("t", T, self.nh, self.hd)).reshape(T, self.nh * self.hd)
+        self.cpu_ms += (time.perf_counter() - t0) * 1e3
+        o = yield ("lin", b + "o", g)
+        return (yield from self._mix_out(b, h, o, work))
+
+    # ---- prefill
     def _attend(self, i, kind, st, chunks):
         """Causal (for swa layers also windowed) attention of a layer's chunks [(q, p0, npu)] over the keys in
         st: on the NPU, all in one go, where npu and a build covers the chunk, else on the CPU. Returns each
@@ -263,42 +402,6 @@ class LFM3:
         self.cpu_ms += (time.perf_counter() - t0) * 1e3
         return o
 
-    def _gated_out(self, b, o, gate):
-        """o_proj of the attention output o (T, nh, hd) times its per-head gate."""
-        t0 = time.perf_counter()
-        o = (o * gate[:, :, None]).reshape(o.shape[0], self.nh * self.hd)
-        self.cpu_ms += (time.perf_counter() - t0) * 1e3
-        return self.cur(b + "o", o)
-
-    def _mix_in(self, b, h):
-        t0 = time.perf_counter()
-        u = rms(h, self.p[b + "attn_norm"])
-        self.cpu_ms += (time.perf_counter() - t0) * 1e3
-        return u
-
-    def _mix_out(self, b, h, o):
-        """The rest of a layer after its token mixer's output o: norm and residual, then the SwiGLU FFN."""
-        t0 = time.perf_counter()
-        h = h + rms(o, self.p[b + "post_attention_norm"])
-        u = rms(h, self.p[b + "ffn_norm"])
-        self.cpu_ms += (time.perf_counter() - t0) * 1e3
-        ffn = getattr(self.cur, "ffn", None)  # the prompt GEMM's fused FFN: act stays on the NPU
-        f = ffn(b + "gateup", b + "down", u) if ffn else None
-        if f is None:
-            gu = self.cur(b + "gateup", u)
-            t0 = time.perf_counter()
-            act = silu(gu[:, : self.ff]) * gu[:, self.ff :]
-            self.cpu_ms += (time.perf_counter() - t0) * 1e3
-            f = self.cur(b + "down", act)
-        t0 = time.perf_counter()
-        h = h + rms(f, self.p[b + "post_ffw_norm"])
-        self.cpu_ms += (time.perf_counter() - t0) * 1e3
-        return h
-
-    def _block(self, b, h, mixer):
-        """One layer around a token mixer (conv or attention): norms, residuals and the SwiGLU FFN."""
-        return self._mix_out(b, h, mixer(self._mix_in(b, h)))
-
     def forward(self, ids, st: State | None = None, keep_hidden: bool = False, all_logits: bool = False):
         """Prefill `ids` at st.pos (a fresh state if None), in chunks of up to 256 tokens, extending the state.
         Returns (logits of the last position, or of every position if all_logits, and the list of per-layer
@@ -307,38 +410,36 @@ class LFM3:
         Layer by layer: every chunk goes through a layer before the next layer starts. An attention layer runs
         every chunk's q/k/v, then every chunk's attention, then every chunk's o_proj and FFN, so with attention
         on the NPU the device switches between the GEMM's and attention's contexts (~1.45 ms each time) twice per
-        layer, not twice per chunk."""
+        layer, not twice per chunk. Within each of these steps two chunks overlap (_drive)."""
         ids = np.asarray(ids)
         st = st or self.new_state(len(ids))
         if st.pos + len(ids) > st.max_len:
             raise ValueError(f"context full ({st.pos} + {len(ids)} tokens > {st.max_len})")
         chunks = [(st.pos + c, ids[c : c + CHUNK]) for c in range(0, len(ids), CHUNK)]
+        n, p0s = len(chunks), [p0 for p0, _ in chunks]
         gemm = [self.prefill_lin is not None and len(ch) >= PREFILL_MIN for _, ch in chunks]
         backends = [self.prefill_lin if g else self.lin for g in gemm]
         hs = [self.embed(ch) for _, ch in chunks]
+        qs = [np.empty((len(ch), self.nh, self.hd), np.float32) for _, ch in chunks]
         snaps = [{} for _ in chunks]  # conv windows at each chunk's end
         hidden = []
-        try:
-            for i in range(self.n_layers):
-                b, kind = f"blk.{i}.", self.kind(i)
-                if kind == "conv":
-                    for j in range(len(chunks)):
-                        self.cur = backends[j]
-                        hs[j] = self._block(b, hs[j], partial(self._conv, b, i, st=st))
-                        snaps[j][i] = st.conv[i].copy()
-                else:
-                    qg = []
-                    for j, (p0, _) in enumerate(chunks):
-                        self.cur = backends[j]
-                        qg.append(self._qkv(b, i, self._mix_in(b, hs[j]), kind, st, p0))
-                    outs = self._attend(i, kind, st, [(qg[j][0], p0, gemm[j]) for j, (p0, _) in enumerate(chunks)])
-                    for j in range(len(chunks)):
-                        self.cur = backends[j]
-                        hs[j] = self._mix_out(b, hs[j], self._gated_out(b, outs[j], qg[j][1]))
-                if keep_hidden:
-                    hidden.append(np.concatenate(hs))
-        finally:
-            self.cur = self.lin
+        self.ropes.clear()
+        for i in range(self.n_layers):
+            b, kind = f"blk.{i}.", self.kind(i)
+            if kind == "conv":
+                tails = [st.conv[i]] + [None] * n  # the conv inputs before each chunk
+                self._drive([(partial(self._conv_layer, b, hs[j], tails, j), backends[j]) for j in range(n)])
+                for j, snap in enumerate(snaps):
+                    snap[i] = tails[j + 1]
+                st.conv[i] = tails[-1].copy()
+            else:
+                qkv = partial(self._qkv, b, i, kind=kind, st=st)
+                gates = self._drive([(partial(qkv, hs[j], p0=p0s[j], q_out=qs[j]), backends[j]) for j in range(n)])
+                outs = self._attend(i, kind, st, [(qs[j], p0s[j], gemm[j]) for j in range(n)])
+                self._drive([(partial(self._attn_out, b, hs[j], outs[j], gates[j]), backends[j]) for j in range(n)])
+            if keep_hidden:
+                hidden.append(np.concatenate(hs))
+        self.ropes.clear()
         for (p0, ch), snap in zip(chunks, snaps, strict=True):
             st.snaps[p0 + len(ch)] = snap
         st.pos += len(ids)
@@ -349,6 +450,11 @@ class LFM3:
     # ---- decode
     def new_state(self, max_len: int = 4096) -> State:
         return State(self, max_len)
+
+    def _block(self, b, h, mixer):
+        """One decode layer around a token mixer (conv or attention): norms, residuals and the SwiGLU FFN."""
+        work = self.work[DEPTH]
+        return self._run(self._mix_out(b, h, mixer(self._mix_in(b, h, work)), work), self.lin)
 
     def _conv_step(self, b, i, u, st):
         P = self.lin(b + "in_proj", u)[0]
@@ -367,7 +473,7 @@ class LFM3:
         t0 = time.perf_counter()
         q = rms(qkv[: nh * hd].reshape(1, nh, hd), self.p[b + "q_norm"])
         k = rms(qkv[nh * hd : (nh + nkv) * hd].reshape(1, nkv, hd), self.p[b + "k_norm"])
-        cos, sin = self.rope(kind, 1, pos)
+        cos, sin = self._rope(kind, 1, pos)  # not cached: a new position every step
         st.k[i][:, pos] = apply_rope(k, cos, sin)[0]
         st.v[i][:, pos] = qkv[(nh + nkv) * hd :].reshape(nkv, hd)
         q = apply_rope(q, cos, sin)[0].reshape(nkv, nh // nkv, hd)  # GQA: query heads grouped by kv head

@@ -73,17 +73,9 @@ def test_cpu_linear_matches_fp32_matmul_on_bf16_weights():
 
 def test_short_conv_matches_naive_causal_convolution():
     d, T = 8, 11
-    m = object.__new__(LFM3)  # exercise _conv without loading a GGUF
-    m.d, m.cpu_ms = d, 0.0
-    m.p = {"b.conv": rng.standard_normal((d, LCONV)).astype(np.float32)}
-
-    class Identity:
-        def __call__(self, name, x):
-            return x
-
-    m.cur = Identity()
+    m = conv_model(d)
     P = rng.standard_normal((T, 3 * d)).astype(np.float32)
-    out = m._conv("b.", 0, P, conv_state(d))
+    out = conv(m, P, conv_state(d))
 
     B, C, X = P[:, :d], P[:, d : 2 * d], P[:, 2 * d :]
     z = B * X
@@ -99,28 +91,35 @@ def test_short_conv_matches_naive_causal_convolution():
 @pytest.mark.parametrize("T", [1, 5])
 def test_conv_is_causal(T):
     d = 4
-    m = object.__new__(LFM3)
-    m.d, m.cpu_ms = d, 0.0
-    m.p = {"b.conv": rng.standard_normal((d, LCONV)).astype(np.float32)}
-    m.cur = lambda name, x: x
+    m = conv_model(d)
     P = rng.standard_normal((T + 3, 3 * d)).astype(np.float32)
-    full = m._conv("b.", 0, P, conv_state(d))
-    prefix = m._conv("b.", 0, P[:T], conv_state(d))
+    full = conv(m, P, conv_state(d))
+    prefix = conv(m, P[:T], conv_state(d))
     np.testing.assert_allclose(full[:T], prefix, rtol=1e-6)
 
 
 def test_conv_state_carries_across_chunks():
     d = 4
-    m = object.__new__(LFM3)
-    m.d, m.cpu_ms = d, 0.0
-    m.p = {"b.conv": rng.standard_normal((d, LCONV)).astype(np.float32)}
-    m.cur = lambda name, x: x
+    m = conv_model(d)
     P = rng.standard_normal((10, 3 * d)).astype(np.float32)
-    whole = m._conv("b.", 0, P, conv_state(d))
+    whole = conv(m, P, conv_state(d))
     st = conv_state(d)
-    parts = np.concatenate([m._conv("b.", 0, P[:3], st), m._conv("b.", 0, P[3:], st)])
+    parts = np.concatenate([conv(m, P[:3], st), conv(m, P[3:], st)])
     np.testing.assert_allclose(parts, whole, rtol=1e-6)
 
 
 def conv_state(d):
     return SimpleNamespace(conv={0: np.zeros((LCONV - 1, d), np.float32)})
+
+
+def conv_model(d):
+    m = object.__new__(LFM3)  # exercise the short conv without loading a GGUF
+    m.d, m.cpu_ms = d, 0.0
+    m.p = {"b.conv": rng.standard_normal((d, LCONV)).astype(np.float32)}
+    return m
+
+
+def conv(m, P, st):
+    """The short conv of in_proj's output P, carrying st's conv window."""
+    g, st.conv[0] = m._short_conv("b.", P, st.conv[0])
+    return g

@@ -6,8 +6,11 @@ the instruction streams of its matrices (`qm4_<N>x<K>.bin`, `qm6only_<N>x<K>.bin
 and sizes at run time and do not depend on the GEMV geometry, so one context runs every build.
 
 Host work per call is kept small: the activations are converted to bf16 on a few threads, and a single-matrix
-result is returned as a view of its device buffer, not copied. Calls take turns between two sets of output
-buffers, so a result stays valid until the call after next (LFM3 uses each one before its next call).
+result is returned as a view of its device buffer, not copied.
+
+A call can overlap the host's other work: `submit` starts it and returns, `collect` waits for its result. Calls
+take turns between three sets of buffers (A, C, act), so two can be in flight while the caller still reads the
+result of the one before: a result stays valid until three more calls have been submitted.
 
 The FFN runs fused (ffn): gate + up, stored interleaved (NpuQLinear glu=True), goes to its `_glu` build, whose
 cores write silu(gate) * up in bf16 into a device buffer that the down projection then reads as its A. The
@@ -30,6 +33,7 @@ from .qlinear import NpuQLinear, deinterleave
 M_TILE = 256
 THREADS = min(4, os.cpu_count() or 1)  # the bf16 conversion is compute-bound: ~2.7x faster on 4 threads
 MIN_ROWS = 32  # per thread
+SETS = 3  # buffer sets, used in turn
 
 
 def program(geo, fmt: int, N: int, K: int) -> str:
@@ -53,12 +57,12 @@ class NpuQGemm:
             raise FileNotFoundError(f"no W4A16 GEMM in {qlin.kdir} (kernels/build_kernels.sh <out> qgemm)")
         path = os.path.join(qlin.kdir, built[0])  # every build has the same cores
         self.kern = self.npu.load("qgemm", path + ".xclbin", path + ".bin")
-        self.a: dict[int, tuple] = {}  # K -> (bo, mapped (256, K) bf16 bits)
-        self.c: list[list[tuple]] = [[], []]  # two sets, used in turn: per matrix of a weight, (bo, bytes)
+        # per set: "a": K -> (bo, mapped (256, K) bf16 bits); "c": per matrix of a weight, (bo, bytes);
+        # "act": (bo, bytes), the fused FFN's silu(gate) * up, only ever on the device
+        self.sets = [{"a": {}, "c": [], "act": None} for _ in range(SETS)]
         self.turn = 0
         self.mats: dict[str, list[tuple[str, int]]] = {}  # name -> [(program, N)], in the GEMV's order
         self.glu: dict[str, tuple[str, int]] = {}  # interleaved gate + up -> (its _glu program, N)
-        self.act = None  # (bo, bytes): the fused FFN's silu(gate) * up, only ever on the device
         self.npu_ms, self.calls = 0.0, 0
         self.pool = ThreadPoolExecutor(THREADS, thread_name_prefix="qgemm") if THREADS > 1 else None
 
@@ -90,72 +94,91 @@ class NpuQGemm:
             if not self._add(prog):
                 insts = os.path.join(self.q.kdir, prog + ".bin")
                 raise FileNotFoundError(f"{name}: no instruction stream {insts} (kernels/build_kernels.sh)")
-            if m["glu"] and self._add(prog + "_glu"):
+            glu = m["glu"] and self._add(prog + "_glu")
+            if glu:
                 self.glu[name] = (prog + "_glu", m["N"])
-                size = M_TILE * m["N"] * 4  # the program writes the whole C size (act at the start)
-                if self.act is None or self.act[1] < size:
-                    self.act = (self.npu.bo(size, self.kern.group(2)), size)
-            if m["K"] not in self.a:
-                bo = self.npu.bo(M_TILE * m["K"] * 2, self.kern.group(0))
-                self.a[m["K"]] = (bo, mapped(bo, np.uint16, (M_TILE, m["K"])))
+            for s in self.sets:
+                size = M_TILE * m["N"] * 4  # the _glu program writes the whole C size (act at the start)
+                if glu and (s["act"] is None or s["act"][1] < size):
+                    s["act"] = (self.npu.bo(size, self.kern.group(2)), size)
+                if m["K"] not in s["a"]:
+                    bo = self.npu.bo(M_TILE * m["K"] * 2, self.kern.group(0))
+                    s["a"][m["K"]] = (bo, mapped(bo, np.uint16, (M_TILE, m["K"])))
             mats.append((prog, m["N"]))
-        for c in self.c:
+        for c in (s["c"] for s in self.sets):
             for j, (_, N) in enumerate(mats):  # sized for the widest matrix in each position
                 if j == len(c) or c[j][1] < M_TILE * N * 4:
                     c[j : j + 1] = [(self.npu.bo(M_TILE * N * 4, self.kern.group(2)), M_TILE * N * 4)]
         self.mats[name] = mats
 
-    def _load_a(self, name: str, x: np.ndarray):
+    def _load_a(self, s: dict, name: str, x: np.ndarray):
         T, K = x.shape
         if T > M_TILE:
             raise ValueError(f"{name}: {T} rows, at most {M_TILE} per call")
-        bo_a, a = self.a[K]
+        bo_a, a = s["a"][K]
         self._to_bf16(a[:T], x)  # rows past T are stale: each output row reads only its own row of A
         bo_a.sync(TO_DEV, T * K * 2, 0)
         return bo_a
 
-    def __call__(self, name: str, x: np.ndarray) -> np.ndarray:
-        """x (T <= 256, K) float32 -> (T, N) float32, valid until the call after next. A weight's matrices
-        share A and run queued together."""
-        T = len(x)
-        t0 = time.perf_counter()
-        bo_a = self._load_a(name, x)
-        mats, c = self.mats[name], self.c[self.turn]
-        self.turn ^= 1
-        runs = [
-            self.kern.start(bo_a, m["bo_w"], c[j][0], program=prog)
-            for j, ((prog, _), m) in enumerate(zip(mats, self.q.mats[name], strict=True))
-        ]
-        outs = []
-        for j, ((prog, N), r, m) in enumerate(zip(mats, runs, self.q.mats[name], strict=True)):
-            finish(r, prog)
-            c[j][0].sync(FROM_DEV, T * N * 4, 0)
-            y = mapped(c[j][0], np.float32)[: T * N].reshape(T, N)
-            outs.append(deinterleave(y) if m["glu"] else y)
-        y = np.concatenate(outs, axis=1) if len(outs) > 1 else outs[0]
-        self.npu_ms += (time.perf_counter() - t0) * 1e3
-        self.calls += len(mats)
-        return y
+    def _set(self) -> dict:
+        s = self.sets[self.turn]
+        self.turn = (self.turn + 1) % SETS
+        return s
 
-    def ffn(self, gateup: str, down: str, x: np.ndarray) -> np.ndarray | None:
-        """down(silu(gate(x)) * up(x)) for x (T <= 256, K) float32 -> (T, N_down) float32, valid until the call
-        after next; None if these weights do not run fused (no _glu build, or not stored interleaved). The two
+    def submit(self, name: str, x: np.ndarray):
+        """Start x (T <= 256, K) float32 times weight name^T; collect() returns the (T, N) float32 result. A
+        weight's matrices share A and run queued together."""
+        t0 = time.perf_counter()
+        s = self._set()
+        bo_a = self._load_a(s, name, x)
+        runs, reads = [], []
+        for j, ((prog, N), m) in enumerate(zip(self.mats[name], self.q.mats[name], strict=True)):
+            bo_c = s["c"][j][0]
+            runs.append((prog, self.kern.start(bo_a, m["bo_w"], bo_c, program=prog)))
+            reads.append((N, bo_c, m["glu"]))
+        self.npu_ms += (time.perf_counter() - t0) * 1e3
+        self.calls += len(runs)
+        return len(x), runs, reads
+
+    def submit_ffn(self, gateup: str, down: str, x: np.ndarray):
+        """Start down(silu(gate(x)) * up(x)) for x (T <= 256, K) float32; collect() returns the (T, N_down)
+        float32 result. None if these weights do not run fused (no _glu build, or not stored interleaved). The two
         programs run queued: the down projection reads the act that the first one leaves on the device."""
         if gateup not in self.glu or len(self.mats.get(down, ())) != 1:
             return None
         (gprog, N), ((dprog, D),) = self.glu[gateup], self.mats[down]
         if self.q.mats[down][0]["K"] != N // 2:
             return None
-        T = len(x)
         t0 = time.perf_counter()
-        bo_a = self._load_a(gateup, x)
-        bo_act, c = self.act[0], self.c[self.turn][0][0]
-        self.turn ^= 1
+        s = self._set()
+        bo_a = self._load_a(s, gateup, x)
+        bo_act, bo_c = s["act"][0], s["c"][0][0]
         r1 = self.kern.start(bo_a, self.q.mats[gateup][0]["bo_w"], bo_act, program=gprog)
-        r2 = self.kern.start(bo_act, self.q.mats[down][0]["bo_w"], c, program=dprog)
-        finish(r1, gprog)
-        finish(r2, dprog)
-        c.sync(FROM_DEV, T * D * 4, 0)
+        r2 = self.kern.start(bo_act, self.q.mats[down][0]["bo_w"], bo_c, program=dprog)
         self.npu_ms += (time.perf_counter() - t0) * 1e3
         self.calls += 2
-        return mapped(c, np.float32)[: T * D].reshape(T, D)
+        return len(x), [(gprog, r1), (dprog, r2)], [(D, bo_c, False)]
+
+    def collect(self, pending) -> np.ndarray:
+        """Wait for a submitted call; returns its result, a view of the call's buffers."""
+        t0 = time.perf_counter()
+        T, runs, reads = pending
+        for prog, r in runs:
+            finish(r, prog)
+        outs = []
+        for N, bo_c, glu in reads:
+            bo_c.sync(FROM_DEV, T * N * 4, 0)
+            y = mapped(bo_c, np.float32)[: T * N].reshape(T, N)
+            outs.append(deinterleave(y) if glu else y)
+        y = np.concatenate(outs, axis=1) if len(outs) > 1 else outs[0]
+        self.npu_ms += (time.perf_counter() - t0) * 1e3
+        return y
+
+    def __call__(self, name: str, x: np.ndarray) -> np.ndarray:
+        """x (T <= 256, K) float32 -> (T, N) float32: submit and collect."""
+        return self.collect(self.submit(name, x))
+
+    def ffn(self, gateup: str, down: str, x: np.ndarray) -> np.ndarray | None:
+        """The fused FFN, submitted and collected; None if it does not run fused (see submit_ffn)."""
+        p = self.submit_ffn(gateup, down, x)
+        return None if p is None else self.collect(p)

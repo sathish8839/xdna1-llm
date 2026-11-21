@@ -304,6 +304,33 @@ grows by more than 8 (in log2 units), so most blocks skip it.
 
   The GEMM calls (7.4 s at 4K) are now two thirds of a long prompt.
 
+## 3f. The host's work between the prompt GEMM calls
+
+After 3e, a 4K-token Q4_K_M prompt spent 7.4 s in the GEMM calls and 2.75 s in numpy between them: RMSNorms
+1.0 s, the short conv 0.76 s, q / k norm, RoPE and gate 0.78 s (only ~0.9 s of it around attention).
+
+* **Page faults:** most of it was not arithmetic. A 256-row chunk's arrays are 2–8 MB, and on Windows a fresh
+  array that size costs ~0.3 ms in page faults (refilling a reused one: 0.016 ms), more than the op on it. The
+  CPU ops now write into scratch arrays reused from layer to layer (`lfm3.Work`), the residual stream is
+  updated in place, and the RoPE tables are made once per chunk instead of once per layer: CPU ops
+  2.75 → 1.46 s, prompt 11.1 → 9.6 s.
+* **Overlap:** the GEMM can run while the host works (`submit` / `collect`, three sets of buffers used in
+  turn). The layer code is generators that yield their linear-layer calls, and a prompt keeps two chunks'
+  calls in flight: while the NPU runs one chunk's GEMM, the host does the other chunk's CPU ops. With the NPU
+  busy, the CPU reads memory it has not touched lately ~2.5x slower (an RMSNorm of a fresh FFN result: 0.34 ms
+  with the NPU idle, 0.88 ms while the next GEMM runs; row blocks and threads do not help), so the CPU ops grow
+  to 3.1 s, but most of that is hidden: 9.6 → 9.1 s. Three or four chunks in flight: 9.0 and 8.9 s.
+* Same output bit for bit: the logits of every position of a 1300-token prompt, its hidden states and the
+  decode steps after it.
+
+  | tokens | before | after |
+  |---|---|---|
+  | 1K | 2.76 s (371 tok/s) | **2.30 s (445 tok/s)** |
+  | 4K | 11.07 s (370 tok/s) | **9.17 s (447 tok/s)** |
+
+  Q4_K_M, alternating runs in the same machine state. At 4K the NPU computes ~6.5 s of GEMM and 0.6 s of
+  attention; ~2 s of host work still does not overlap.
+
 ## 4. LFM3-1.7B prefill with linears on the NPU
 
 Engine: two kernels (256×2048×1024 and 256×7680×1024, bf16 → fp32, n = 32), 567 calls per forward pass,
