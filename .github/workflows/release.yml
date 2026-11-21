@@ -24,6 +24,12 @@ jobs:
       - run: >
           sudo apt-get update && sudo apt-get install -y build-essential clang clang-14 lld lld-14 cmake
           ninja-build python3-venv python3-pip uuid-dev jq
+      - name: Stand-in xrt-smi
+        # mlir-aie's env_setup.sh asks xrt-smi which NPU is present and stops without it. The runner has no NPU
+        # and needs none to compile; an empty answer means npu1, which is what we build.
+        run: |
+          mkdir -p ~/bin && printf '#!/bin/sh\nexit 0\n' > ~/bin/xrt-smi && chmod +x ~/bin/xrt-smi
+          echo "$HOME/bin" >> "$GITHUB_PATH"
       - uses: actions/cache@v4
         with:
           path: ~/mlir-aie
