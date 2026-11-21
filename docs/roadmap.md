@@ -12,7 +12,7 @@ tokenizes, schedules and samples.
 | M1 | Prefill with every linear layer on the NPU (bf16), verified against llama.cpp | ✅ |
 | M2 | Native tokenizer, chat template, sampling and a generation loop (no llama-server needed) | ✅ |
 | M3 | Decode on the NPU: M=1 GEMV kernel, KV cache, short-conv state | ✅ |
-| M4 | **Q4_K_M** weights: Q4_K / Q6_K repacked at load and dequantized on the NPU | ✅ decode; W4A16 prefill open |
+| M4 | **Q4_K_M** weights: Q4_K / Q6_K repacked at load and dequantized on the NPU | ✅ |
 | M5 | OpenAI-compatible server: `/v1/chat/completions` (SSE streaming, tool calls), `/v1/models` | ✅ |
 | M6 | **v0.1 release:** WinUI 3 app (chat, thinking toggle, DuckDuckGo web search) and an installer with prebuilt kernels | ✅ [v0.1.0](https://github.com/sathish8839/xdna1-llm/releases/tag/v0.1.0) (pre-release) |
 | M7 | Every op on the NPU: fused per-layer designs (norms, conv, RoPE, attention, SwiGLU) | |
@@ -63,9 +63,9 @@ These come from measurements in [benchmarks.md](benchmarks.md) (the last one is 
 * One context for every quantized GEMV (format and sizes travel with the data): done, 8.5 → 11–12 tok/s.
 * q/k/v as one call, completion polling instead of a sleeping wait: done, 11–12 → ~14 tok/s.
 * Faster 6-bit kernel: done (Q6_K GEMVs 15–25 % faster, Q4_K ~10 %; all-Q6_K models stream no padding).
-* Batched prompt: done. Prompt chunks of 32–256 tokens run on the bf16 prefill GEMM with a bf16 copy of the
-  weights made at load (+2.9 GB RAM, +25 s load), then decode continues from the same state: 689 tokens in 5.1 s
-  instead of 38.6 s, KLD 0.00005 against the CPU ([benchmarks 3d](benchmarks.md#3d-batched-prompt)).
+* Batched prompt: done. Prompt chunks of 32–256 tokens run on the W4A16 GEMM over the decode weights, then
+  decode continues from the same state: ~180 tok/s instead of 16, KLD 0.00004 against the CPU
+  ([benchmarks 3d](benchmarks.md#3d-batched-prompt)).
 * Next: the CPU ops between calls on the NPU (M7) so a layer needs fewer round trips.
   The GEMV loop still waits on latency more than on the MAC unit (broadcasting x is the largest remaining cost);
   32-row blocks would share each broadcast between two MACs.
@@ -83,8 +83,11 @@ GGUF Q4_K_M mixes **Q4_K** (most tensors) and **Q6_K** (for LFM3-1.7B: `token_em
 1. **Repack at load** (one time): reorder super-blocks into the tile order the kernels consume and unpack the
    6-bit scales/mins (`w = d·sc·q − dmin·m`). Done for Q4_K and Q6_K (`xdna1_llm/q4k.py`, `q6k.py`),
    lossless; tested against `gguf.quants`.
-2. **W4A16 kernel:** unpack nibbles in the vector unit, apply the group scale and min, then bf16 `mmul`. It
-   would replace the bf16 weight copy the batched prompt uses today (2.9 GB, ~25 s of load).
+2. **W4A16 kernel:** done (`kernels/designs/qgemm.py`). The core unpacks the GEMV's tiles to bf16 in the vector
+   unit (group scale and min applied, rounded to nearest even) and runs bf16 `mmul`, reading the same device
+   buffers as decode. It replaced the bf16 weight copy: 2.8 GB less RAM, load 31 → 8 s, prompt 138 → 178 tok/s
+   ([benchmarks 3d](benchmarks.md#3d-batched-prompt)). Next: the host work around each call (bf16 conversion,
+   output copy), now half of the GEMM time.
 3. **Optional W4A8:** AIE2's int4 × int8 MAC modes with per-token int8 activations. Faster, slightly different
    numerics; benchmark against (2).
 4. Q6_K: same structure with a 6-bit unpack. Done for decode (`kernels/designs/qgemv.cc`).

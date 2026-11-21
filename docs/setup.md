@@ -63,8 +63,9 @@ cd /mnt/d/path/to/xdna1-llm
 MLIR_AIE=~/mlir-aie XRT_SDK_WIN=/mnt/c/Users/<you>/xrt_sdk/xrt_sdk/xrt ./kernels/build_kernels.sh kernels/build all
 ```
 
-Kernel sets: `engine` (the two prefill GEMMs), `qgemv` (the Q4_K / Q6_K decode GEMV, every shape of Q4_K_M and Q6_K
-models), `gemv` (bf16 decode GEMV), `shapes` (benchmark kernels), `bw`, `smoke`, `all`.
+Kernel sets: `qgemv` (the Q4_K / Q6_K decode GEMV, every shape of Q4_K_M and Q6_K models), `qgemm` (the W4A16
+prompt GEMM, which reads the same weights), `engine` (the bf16 prompt GEMMs, used only when `qgemm` is not built),
+`gemv` (bf16 decode GEMV), `shapes` (benchmark kernels), `bw`, `smoke`, `all`.
 
 **In CI** (`.github/workflows/release.yml`, on a `v*` tag or by hand) the kernels build on an Ubuntu runner from
 mlir-aie at the pinned commit. XRT ships no Linux `xclbinutil`, so with `XCLBINUTIL_DEFER=<dir>` the build

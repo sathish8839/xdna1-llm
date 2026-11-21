@@ -1,8 +1,9 @@
 """Device-ready weight layouts on disk, so loading a model again skips converting its weights.
 
 The NPU backends turn GGUF weights into the exact bytes their device buffers hold: the GEMV repacks Q4_K / Q6_K
-into its tile layout, the prefill GEMM dequantizes to bf16 and transposes. That takes most of a load (~30 s for
-LFM3-1.7B). The cache keeps each result as an .npy file and maps it back on the next load:
+into its tile layout (which the W4A16 prompt GEMM reads too); the bf16 prompt GEMM, when used, dequantizes to bf16
+and transposes. That takes most of a load (~7 s for LFM3-1.7B, ~35 s with the bf16 GEMM). The cache keeps each
+result as an .npy file and maps it back on the next load:
 
     %LOCALAPPDATA%/xdna1-llm/cache/<model>-<key>/<backend>/<weight>.npy
 

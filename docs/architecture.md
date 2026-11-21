@@ -6,10 +6,13 @@ This describes what exists today. Planned parts (the installer, fused kernels) a
 ```
 engine/src/xdna1_llm/
   npu/device.py      pyxrt wrapper: device, kernels (hw contexts), buffers, zero-copy numpy views
-  npu/linear.py      NpuLinear: every projection as 1024-wide chunks on two fixed GEMM kernels
+  npu/qlinear.py     NpuQLinear: decode, Q4_K / Q6_K weights repacked once into device buffers, on the quantized GEMV
+  npu/qgemm.py       NpuQGemm: prompts of up to 256 tokens on the W4A16 GEMM, reading NpuQLinear's buffers
+  npu/linear.py      NpuLinear: the older bf16 prompt path, 1024-wide chunks on two fixed GEMM kernels
   cpu_linear.py      CpuLinear: the same interface in numpy, as a reference and fallback
   models/lfm3.py     LFM3: batched prefill and one-token decode over a shared state, on one or two linear backends
-  gguf_weights.py    memory-mapped GGUF tensors (BF16, F32)
+  gguf_weights.py    memory-mapped GGUF tensors (BF16, F32, Q4_K, Q6_K, ...)
+  q4k.py, q6k.py     the GEMV / GEMM tile layout of Q4_K and Q6_K, lossless
   weight_cache.py    the NPU backends' converted weights on disk, so a later load skips converting them
   bf16.py            float32 <-> bf16 bit conversion
   tokenizer.py       byte-level BPE from the GGUF (Llama 3 pre-tokenizer), identical to llama.cpp
@@ -28,7 +31,8 @@ app/                 WinUI 3 chat app (C#, unpackaged, Windows App SDK copied ne
   Themes.cs          the five looks: shared brushes recoloured in place, WinUI control colours, composition animations
   Hotkey.cs          Spotlight's system-wide Alt+Space
   MainWindow.xaml    status bar, chat, composer with the thinking and web search toggles
-kernels/build_kernels.sh   builds the xclbins from mlir-aie's whole_array GEMM example
+kernels/designs/     IRON designs and their core C++: qgemv (decode), qgemm (prompt), gemv, stream_bw
+kernels/build_kernels.sh   builds the xclbins (the designs, and mlir-aie's whole_array GEMM example)
 ```
 
 ## Constraints that shape the design
@@ -36,8 +40,9 @@ kernels/build_kernels.sh   builds the xclbins from mlir-aie's whole_array GEMM e
 All of these were measured on the Windows driver; see [benchmarks.md](benchmarks.md).
 
 1. **At most 5 hardware contexts.** Opening a 6th fails. The engine uses two.
-2. **Switching between contexts costs ~1.45 ms. Swapping buffers within a context is free.** So there is
-   one kernel per K dimension, reused for every layer, with each weight chunk in its own resident buffer.
+2. **Switching between contexts costs ~1.45 ms. Swapping buffers within a context is free.** So each kernel
+   takes its sizes at run time: one context runs every decode GEMV, one every prompt GEMM, with each weight in
+   its own resident buffer that both read.
 3. **Each dispatch costs ~0.1–0.2 ms.** All chunks of a projection are queued first and then awaited.
 4. **64 KB of data memory per compute tile.** An fp32 64×64 output tile plus double-buffered inputs does
    not fit, so the kernels use 64×64×32 tiles.

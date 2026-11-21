@@ -6,9 +6,9 @@ r"""What does quantization cost, and does our engine add anything on top? Scores
 Variants, all compared with `bf16` (the original weights in fp32 on the CPU, the reference):
   * one per --quant GGUF, named after its type (q4_k_m, q6_k, ...), in fp32 on the CPU: the cost of the format;
   * with --npu, the first one again on the NPU: through the decode path, one token at a time on the quantized
-    GEMV (`q4_k_m-npu`), and as a batched prompt on the bf16 GEMM with a bf16 copy of the weights
-    (`q4_k_m-gemm`). Their lines against the CPU run of the same file are the cost of our engine, which should
-    be ~0.
+    GEMV (`q4_k_m-npu`), and as a batched prompt on the prompt GEMM (`q4_k_m-gemm`: the W4A16 GEMM, or the
+    bf16 one if that is not built). Their lines against the CPU run of the same file are the cost of our
+    engine, which should be ~0.
 Each chunk of the text starts from an empty context (metrics: xdna1_llm.quality). The CPU variants are slow
 (weights are dequantized on every call): ~1 min per 256-token chunk.
 """
@@ -75,12 +75,12 @@ def evaluate():
     first = list(variants)[1]
     pairs = [(v, "bf16") for v in variants]
     if a.npu:
-        from xdna1_llm.npu.linear import NpuLinear  # imports pyxrt
-        from xdna1_llm.npu.qlinear import NpuQLinear
+        from xdna1_llm.engine import gemm_backend
+        from xdna1_llm.npu.qlinear import NpuQLinear  # imports pyxrt
 
         w = variants[first][0].w
         qlin = NpuQLinear(kernel_dir=a.kernels, formats=w.types())
-        m = LFM3(w, qlin, NpuLinear(qlin.npu, qlin.kdir))  # step() uses the GEMV, forward() the GEMM
+        m = LFM3(w, qlin, gemm_backend(qlin))  # step() uses the GEMV, forward() the GEMM
         variants[first + "-npu"] = (m, decode_logits)
         variants[first + "-gemm"] = (m, prefill_logits)
         pairs += [(v, ref) for v in (first + "-npu", first + "-gemm") for ref in ("bf16", first)]

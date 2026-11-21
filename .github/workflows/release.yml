@@ -44,7 +44,7 @@ jobs:
           fi
       - name: Build kernels
         run: |
-          for set in engine qgemv; do
+          for set in qgemv qgemm; do
             MLIR_AIE=~/mlir-aie XCLBINUTIL_DEFER=calls ./kernels/build_kernels.sh kernels-out "$set" | tee -a build.log
           done
           if grep -q '^FAIL' build.log; then cat kernels-out/*.log; exit 1; fi

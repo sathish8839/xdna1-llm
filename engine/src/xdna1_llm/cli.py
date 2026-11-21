@@ -148,12 +148,12 @@ def generate(a, w, tok, srv, ids):
         from .npu.qlinear import NpuQLinear  # imports pyxrt
 
         lin = NpuQLinear(kernel_dir=a.kernels, formats=w.types())
-        prefill_lin = None if a.no_gemm_prompt else gemm_backend(lin.npu, lin.kdir)
+        prefill_lin = None if a.no_gemm_prompt else gemm_backend(lin)
     else:
         lin, prefill_lin = CpuLinear(), None
     m = LFM3(w, lin, prefill_lin)
     repack = f" (repack {lin.repack_s:.1f} s, {lin.geo.name} tiles)" if a.backend == "npu" else ""
-    prompt_on = "bf16 GEMM" if prefill_lin else "decode GEMV"
+    prompt_on = {"NpuQGemm": "W4A16 GEMM", "NpuLinear": "bf16 GEMM"}.get(type(prefill_lin).__name__, "decode GEMV")
     print(
         f"[{a.backend}] weights ready in {m.load_s:.1f} s{repack}; prompt {len(ids)} tokens on the {prompt_on}",
         flush=True,

@@ -16,7 +16,8 @@ prefilled in one batch and then continued token by token.
 
 Two linear backends: `lin` serves decode (and prefill when there is no other), `prefill_lin` (optional) serves
 prompt chunks of at least PREFILL_MIN tokens. For a Q4_K_M / Q6_K model on the NPU, `lin` is the quantized GEMV
-(one token per call) and `prefill_lin` the bf16 GEMM, which makes a bf16 copy of every linear weight at load.
+(one token per call) and `prefill_lin` the W4A16 GEMM, which reads the GEMV's weights (or, if it is not built, the
+bf16 GEMM, which makes a bf16 copy of every linear weight at load).
 """
 
 from __future__ import annotations

@@ -43,14 +43,18 @@ class RequestError(ValueError):
     """The request cannot be served as given (HTTP 400)."""
 
 
-def gemm_backend(npu, kdir, cache=None):
-    """The bf16 GEMM for batched prompts, sharing the device; None (with a note) if its kernels are not built."""
+def gemm_backend(qlin, cache=None):
+    """The GEMM for batched prompts, sharing qlin's device: the W4A16 GEMM, which reads qlin's weights, if it is
+    built, else the bf16 GEMM (a bf16 copy of every weight); None (with a note) if neither is."""
     from .npu.linear import SUPPORTED_K, NpuLinear
+    from .npu.qgemm import NpuQGemm, builds
 
-    if not all(os.path.exists(os.path.join(kdir, f"gemm_256x{k}x1024_bf16_f32.xclbin")) for k in SUPPORTED_K):
-        print(f"note: no bf16 GEMM kernels in {kdir} (kernels/build_kernels.sh <out> engine); prompt runs on the GEMV")
-        return None
-    return NpuLinear(npu, kdir, cache=cache)
+    if builds(qlin.kdir, qlin.geo):
+        return NpuQGemm(qlin)
+    if all(os.path.exists(os.path.join(qlin.kdir, f"gemm_256x{k}x1024_bf16_f32.xclbin")) for k in SUPPORTED_K):
+        return NpuLinear(qlin.npu, qlin.kdir, cache=cache)
+    print(f"note: no prompt GEMM in {qlin.kdir} (kernels/build_kernels.sh <out> qgemm); prompt runs on the GEMV")
+    return None
 
 
 class Engine:
@@ -82,7 +86,7 @@ class Engine:
 
             cache = WeightCache.for_model(gguf) if weight_cache else None
             lin = NpuQLinear(kernel_dir=kernels, formats=w.types(), cache=cache)
-            model = LFM3(w, lin, gemm_backend(lin.npu, lin.kdir, cache) if gemm_prompt else None)
+            model = LFM3(w, lin, gemm_backend(lin, cache) if gemm_prompt else None)
             kw.setdefault("device", lin.npu.name)
         else:
             model = LFM3(w, CpuLinear())

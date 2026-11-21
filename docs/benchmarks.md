@@ -162,23 +162,31 @@ runs as a batch on the bf16 GEMM ([3d](#3d-batched-prompt)); the table below fed
 ## 3d. Batched prompt
 
 The quantized GEMV takes one token per call, so a prompt fed through it runs at decode speed. `xdna1-llm
---generate` instead runs prompt chunks of 32 to 256 tokens on the bf16 prefill GEMM (section 4), with a bf16 copy of
-every linear weight made at load, and decodes on the GEMV from the state the prompt left. Three contexts in all.
+--generate` instead runs prompt chunks of 32 to 256 tokens on a GEMM and decodes on the GEMV from the state the
+prompt left. The GEMM is the **W4A16 GEMM** (`kernels/designs/qgemm.py`): it reads the GEMV's Q4_K / Q6_K tiles
+from the same device buffers, turns each 64-column slice into bf16 on the core and runs mlir-aie's bf16 `mmul`
+on it. Two contexts in all. Before it, prompts ran on the bf16 GEMM (section 4) with a bf16 copy of every weight.
 
-| Q4_K_M, 689-token chat prompt | prompt | load | extra RAM |
-|---|---|---|---|
-| one token at a time on the GEMV (`--no-gemm-prompt`) | 38.6 s (17.9 tok/s) | 8.6 s | — |
-| **batched on the bf16 GEMM** | **5.1 s (135 tok/s)** | 33.7 s | 2.9 GB |
+| Q4_K_M, 817-token prompt (`docs/architecture.md`) | prompt | in the GEMM | load | process RAM |
+|---|---|---|---|---|
+| one token at a time on the GEMV (`--no-gemm-prompt`) | ~47 s (16 tok/s) | — | 8 s | 2.6 GB |
+| bf16 GEMM, bf16 weight copy | 5.9 s (138 tok/s) | 3.47 s | 30.8 s | 5.4 GB |
+| **W4A16 GEMM** | **4.6 s (178 tok/s)** | **2.14 s** | **8.2 s** | **2.6 GB** |
 
-* Both give the same greedy output. Accuracy against the CPU run of the same file ([section 6](#6-accuracy-what-quantization-costs)):
-  KLD 0.00005 (Q4_K_M) and 0.00004 (Q6_K), so rounding the dequantized weights to bf16 costs nothing measurable.
+* Q6_K, 647-token prompt: 4.6 s (141 tok/s) on the bf16 GEMM, 3.4 s (192 tok/s) on the W4A16 GEMM.
+* Same numerics as the bf16 GEMM: both multiply bf16 activations by the weights dequantized and rounded to bf16
+  (to nearest even), and give the same greedy output. Against the CPU run of the same file
+  ([section 6](#6-accuracy-what-quantization-costs)): KLD 0.00004 (Q4_K_M, 1020 tokens), as the bf16 GEMM's
+  0.00005. Every LFM3 shape matches numpy to 2–7e-4 of the largest output (`benchmarks/bench_qgemm.py`).
+* Kernel alone, M = 256: 2.1–2.3 TFLOP/s on LFM3's large shapes (15360×2048 in 7.6 ms, 2048×7680 in 3.6–3.8 ms),
+  1.5 TFLOP/s on 512×2048; the bf16 GEMM runs 15360×2048 as 15 chunks in ~13.6 ms. The core spends about as
+  long making B from the 4-bit tiles as in the `mmul`, and reads 4.5–6.6 bits per weight instead of 16.
+* Half of the GEMM time is now host work around each call: converting the activations to bf16 (1.5–6 ms per
+  call) and copying the output (up to 4 ms for 15360 columns). The CPU ops between calls take the other 2.3 s.
 * Chunks shorter than 32 tokens stay on the GEMV: the GEMM always computes 256 rows, which takes about as long
   as ~25 single-token steps.
-* The cost is the copy: 2.9 GB more RAM and ~25 s more load (dequantizing and uploading). A GEMM that reads the
-  quantized tiles directly (roadmap M4, W4A16) would remove both.
-* The weight cache keeps both backends' device layouts on disk (3.9 GB for Q4_K_M). Loading Q4_K_M through
-  `Engine` with the GEMM: 38.0 s without the cache, 57.7 s the first time (writing it), 18.5 s after (12.4 s of
-  it in `Engine.load`), with identical greedy output.
+* The weight cache now holds only the GEMV tiles, 1.2 GB instead of 3.9 GB. Loading Q4_K_M through
+  `Engine`: 14.7 s the first time (writing the cache), 8.2 s after, against 57.7 s and 18.5 s with the bf16 copy.
 
 ## 4. LFM3-1.7B prefill with linears on the NPU
 

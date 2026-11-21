@@ -5,6 +5,20 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- W4A16 prompt GEMM (`kernels/designs/qgemm.py`, `xdna1_llm.npu.qgemm`): prompts read the Q4_K / Q6_K weights
+  the decode GEMV already holds on the device, so the bf16 weight copy is gone. Q4_K_M: 2.8 GB less RAM, load
+  31 → 8 s, prompt 138 → 178 tok/s (Q6_K 141 → 192 tok/s), same output (KLD 0.00004 against the CPU). New
+  kernel set `qgemm` in `kernels/build_kernels.sh`; releases ship `qgemv` + `qgemm`. The bf16 GEMM stays as the
+  fallback when `qgemm` is not built.
+
+### Changed
+
+- The GEMV tile layout keeps each super-block's bytes together (`xdna1_llm.q4k.sb_tiles`), so the GEMM can read
+  it a super-block at a time. Decode speed and output are unchanged; kernels built for v0.1.0 do not run with
+  this layout (rebuild `qgemv`), and the weight cache starts afresh.
+
 ## [0.1.0] - 2026-11-21
 
 The first release: LiquidAI LFM3-1.7B on the XDNA1 NPU of Ryzen 7040 / 8040 / Ryzen 200 laptops, on Windows.

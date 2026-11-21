@@ -3,8 +3,8 @@
 #
 #   MLIR_AIE=~/mlir-aie XRT_SDK_WIN=/mnt/c/.../xrt_sdk/xrt ./kernels/build_kernels.sh [out_dir] [set]
 #
-# sets: engine (default: the two chunk GEMMs the engine needs), gemv / qgemv (bf16 / Q4_K + Q6_K decode GEMVs),
-#       bw (streaming probes),
+# sets: qgemv (Q4_K + Q6_K decode GEMVs), qgemm (W4A16 prompt GEMMs on the same weights),
+#       engine (default: the bf16 chunk GEMMs, the older prompt path), gemv (bf16 decode GEMVs), bw (streaming probes),
 #       shapes (per-shape GEMM benchmark kernels), smoke, all
 # Requires: an mlir-aie checkout with its ironenv (utils/env_install.sh) and xclbinutil on PATH
 # (on WSL use kernels/xclbinutil-wsl, which this script puts on PATH automatically).
@@ -111,6 +111,19 @@ if [[ "$SET" == qgemv || "$SET" == all ]]; then
   # q6only geometry (no padding), all-Q6_K models: every tensor
   for shape in 2048x2048 3072x2048 6144x2048 15360x2048 128000x2048 2048x7680; do
     design "q6only_$shape" qgemv.py -Q 6 -N "${shape%x*}" -K "${shape#*x}" --geometry q6only
+  done
+fi
+if [[ "$SET" == qgemm || "$SET" == all ]]; then
+  # the prompt GEMM reads the qgemv weights, so it has the same shapes (minus the LM head, which stays on the
+  # GEMV); its cores do not depend on the geometry, so one context runs every build
+  for shape in 512x2048 2048x2048 2560x2048 3072x2048 6144x2048 15360x2048 2048x7680; do
+    design "qm4_$shape" qgemm.py -Q 4 -N "${shape%x*}" -K "${shape#*x}"
+  done
+  for shape in 512x2048 2048x7680; do
+    design "qm6_$shape" qgemm.py -Q 6 -N "${shape%x*}" -K "${shape#*x}"
+  done
+  for shape in 2048x2048 3072x2048 6144x2048 15360x2048 2048x7680; do
+    design "qm6only_$shape" qgemm.py -Q 6 -N "${shape%x*}" -K "${shape#*x}" --geometry q6only
   done
 fi
 if [[ "$SET" == bw || "$SET" == all ]]; then

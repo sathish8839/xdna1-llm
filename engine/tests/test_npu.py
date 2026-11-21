@@ -1,5 +1,5 @@
 """On-device tests: need an XDNA1 NPU, pyxrt, and kernels from `kernels/build_kernels.sh <out> engine` / `smoke` /
-`qgemv`."""
+`qgemv` / `qgemm`."""
 
 import os
 
@@ -73,3 +73,43 @@ def test_npu_qlinear_matches_gguf_dequantization(npu, kind, geometry, n):
     x = rng.standard_normal((2, k)).astype(np.float32)
     ref = from_bf16(to_bf16(x)).astype(np.float64) @ mod.dequantize(raw).T.astype(np.float64)
     np.testing.assert_allclose(lin("w", x), ref, rtol=0, atol=1e-4 * np.abs(ref).max())
+
+
+def random_quant(kind, n, k, rng):
+    from xdna1_llm import q4k, q6k
+
+    mod = {"Q4_K": q4k, "Q6_K": q6k}[kind]
+    raw = rng.integers(0, 256, size=(n, k // 256, mod.BLOCK_BYTES), dtype=np.uint8)
+    scales = rng.uniform(1e-4, 1e-3, size=(n, k // 256, 2)).astype(np.float16).view(np.uint8)
+    if kind == "Q4_K":
+        raw[..., 0:4] = scales
+    else:
+        raw[..., 208:210] = scales[..., :2]
+    return raw.reshape(n, -1), mod
+
+
+@pytest.mark.parametrize(("kinds", "geometry"), [(("Q4_K", "Q6_K"), "unified"), (("Q6_K",), "q6only")])
+def test_npu_qgemm_matches_bf16_weights(npu, kinds, geometry):
+    """The prompt GEMM on the decode GEMV's weights: A (bf16) times the weights dequantized and rounded to bf16.
+    Two parts of different formats (q + v of an attention layer) run as two matrices of one weight."""
+    from xdna1_llm.npu.qgemm import NpuQGemm, program
+    from xdna1_llm.npu.qlinear import NpuQLinear
+
+    lin = NpuQLinear(npu, formats=set(kinds))
+    n, k = (512, 2048) if geometry == "unified" else (2048, 2048)
+    progs = [program(lin.geo, 4 if kd == "Q4_K" else 6, n, k) for kd in kinds]
+    missing = [p for p in progs if not os.path.exists(os.path.join(lin.kdir, p + ".bin"))]
+    if missing:
+        pytest.skip(f"{missing} not built (kernels/build_kernels.sh <out> qgemm)")
+    rng = np.random.default_rng(1)
+    parts = [random_quant(kd, n, k, rng) for kd in kinds]
+    lin.register("w", [(kd, raw) for kd, (raw, _) in zip(kinds, parts, strict=True)])
+    gemm = NpuQGemm(lin)
+    gemm.register("w")
+    wq = np.concatenate([from_bf16(to_bf16(mod.dequantize(raw))) for raw, mod in parts]).astype(np.float64)
+    for T in (256, 37):  # a full tile, then fewer rows over the stale ones
+        x = rng.standard_normal((T, k)).astype(np.float32)
+        ref = from_bf16(to_bf16(x)).astype(np.float64) @ wq.T
+        y = gemm("w", x)
+        assert y.shape == (T, n * len(kinds))
+        np.testing.assert_allclose(y, ref, rtol=0, atol=1e-3 * np.abs(ref).max())
