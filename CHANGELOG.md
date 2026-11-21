@@ -5,6 +5,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-21
+
+Prompts now read the 4-bit weights directly on the NPU instead of a bf16 copy of them. For Q4_K_M that means
+2.8 GB less RAM, loading in ~8 s instead of ~31 s, and prompts at ~200 tok/s instead of ~138, with the same
+output. Decode is unchanged. Kernels built for v0.1.0 do not work with this version; the installer brings new
+ones, and the weight cache rebuilds itself on the first load.
+
 ### Added
 
 - W4A16 prompt GEMM (`kernels/designs/qgemm.py`, `xdna1_llm.npu.qgemm`): prompts read the Q4_K / Q6_K weights
@@ -116,5 +123,6 @@ OpenAI-compatible local server. Tested on one laptop (Ryzen 7 250) with NPU driv
 - `eval_quality.py` started every chunk with the text's first token instead of BOS (llama.cpp adds no BOS for
   LFM3); accuracy numbers re-measured.
 
-[Unreleased]: https://github.com/sathish8839/xdna1-llm/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/sathish8839/xdna1-llm/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/sathish8839/xdna1-llm/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/sathish8839/xdna1-llm/releases/tag/v0.1.0

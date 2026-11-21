@@ -18,7 +18,7 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
   </PropertyGroup>
   <ItemGroup>
     <!-- WinUI alone, not the Microsoft.WindowsAppSDK metapackage: that also ships the AI/ML runtimes (~40 MB). -->

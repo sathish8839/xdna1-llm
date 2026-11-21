@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xdna1-llm"
-version = "0.1.0"
+version = "0.2.0"
 description = "Run LLMs entirely on first-generation AMD XDNA (Ryzen 7040/8040/200, npu1) NPUs"
 readme = "README.md"
 license = "Apache-2.0"
