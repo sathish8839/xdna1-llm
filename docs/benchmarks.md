@@ -173,6 +173,30 @@ runs as a batch on the bf16 GEMM ([3d](#3d-batched-prompt)); the table below fed
 
   The machine was in its slower state for this run (on a faster day the same build reaches ~17 tok/s). KLD of
   token-by-token decode against the CPU run of the same file: 0.00003 (was 0.00002).
+* **How close to the memory limit (fast day, 17.8 tok/s):** the 8-lane streaming probe (`stream_bw.py`, 64 and
+  192 MB) moves 33.5 GB/s with ~0.07 ms fixed per call; 4 lanes reach 23.7. The machine has one DDR5-5600 module,
+  so a single channel: 44.8 GB/s in theory, and the CPU's best copy also tops out near 33 GB/s. A token reads
+  1280 MB of weights in the device layout over 102 calls, so at the ceiling it would take 38 + 7 ms; the
+  calls measure 51 ms, **~90 %** of the ceiling:
+
+  | weight (per call) | MB | time | GB/s | of ceiling |
+  |---|---|---|---|---|
+  | FFN gate + up (Q4_K) | 20.7 | 0.74 ms | 28.0 | 93 % |
+  | FFN down Q4_K / Q6_K | 11.0 / 14.0 | 0.46 / 0.59 ms | 23.8 | 83–86 % |
+  | conv in_proj | 8.3 | 0.37 ms | 22.2 | 85 % |
+  | q + k + v | 4.5 | 0.29 ms | 15.7 | 95 % |
+  | o, conv out | 2.8 | 0.19 ms | 14.4 | 80 % |
+  | LM head (Q6_K) | 263 | 7.7 ms | 34.2 | 103 % |
+
+  Decode is memory bound: faster kernels can win at most ~10 %. What is left is reading fewer bytes (the device
+  layout is 5.25 bits per Q4_K weight against the file's 4.5, 7.1 per Q6_K against 6.56) or more tokens per pass
+  over the weights (speculative decoding).
+* **Speculative decoding, checked and set aside:** replaying a prompt-lookup drafter against greedy outputs
+  (200 tokens each) gives 1.04 tokens per pass for a story, 1.13 for an explanation, 1.31 for a summary and
+  1.7–2.0 for a code edit or a rewrite of the prompt (drafts of up to 4–8 tokens). Checking a draft needs a GEMV
+  over several x vectors: the prompt GEMM dequantizes into memory first and is ~6x slower per core, so one pass
+  costs about ten decode steps. The GEMV core is near its compute limit as well, so several rows would cost about as
+  much as the tokens they save, outside of code edits and rewrites.
 * llama.cpp's greedy output for the same prompt diverges after a few tokens where two candidates are close.
   At that step both the fp32 reference and llama.cpp's own prompt evaluation rank our token first; llama.cpp's
   CPU decode path rounds activations to 8 bits, so its token-by-token output differs slightly from its own
