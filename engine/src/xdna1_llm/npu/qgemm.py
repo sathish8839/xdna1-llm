@@ -58,8 +58,9 @@ class NpuQGemm:
         path = os.path.join(qlin.kdir, built[0])  # every build has the same cores
         self.kern = self.npu.load("qgemm", path + ".xclbin", path + ".bin")
         # per set: "a": K -> (bo, mapped (256, K) bf16 bits); "c": per matrix of a weight, (bo, bytes);
-        # "act": (bo, bytes), the fused FFN's silu(gate) * up, only ever on the device
-        self.sets = [{"a": {}, "c": [], "act": None} for _ in range(SETS)]
+        # "act": (bo, bytes), the fused FFN's silu(gate) * up, only ever on the device; "y": float32, the result of
+        # a weight with several matrices, their outputs side by side (reused: a fresh 3 MB array page-faults)
+        self.sets = [{"a": {}, "c": [], "act": None, "y": np.empty(0, np.float32)} for _ in range(SETS)]
         self.turn = 0
         self.mats: dict[str, list[tuple[str, int]]] = {}  # name -> [(program, N)], in the GEMV's order
         self.glu: dict[str, tuple[str, int]] = {}  # interleaved gate + up -> (its _glu program, N)
@@ -109,6 +110,10 @@ class NpuQGemm:
             for j, (_, N) in enumerate(mats):  # sized for the widest matrix in each position
                 if j == len(c) or c[j][1] < M_TILE * N * 4:
                     c[j : j + 1] = [(self.npu.bo(M_TILE * N * 4, self.kern.group(2)), M_TILE * N * 4)]
+        size = M_TILE * sum(N for _, N in mats)
+        for s in self.sets:
+            if len(mats) > 1 and s["y"].size < size:
+                s["y"] = np.empty(size, np.float32)
         self.mats[name] = mats
 
     def _load_a(self, s: dict, name: str, x: np.ndarray):
@@ -136,9 +141,10 @@ class NpuQGemm:
             bo_c = s["c"][j][0]
             runs.append((prog, self.kern.start(bo_a, m["bo_w"], bo_c, program=prog)))
             reads.append((N, bo_c, m["glu"]))
+        y = s["y"][: len(x) * sum(N for N, _, _ in reads)].reshape(len(x), -1) if len(reads) > 1 else None
         self.npu_ms += (time.perf_counter() - t0) * 1e3
         self.calls += len(runs)
-        return len(x), runs, reads
+        return len(x), runs, reads, y
 
     def submit_ffn(self, gateup: str, down: str, x: np.ndarray):
         """Start down(silu(gate(x)) * up(x)) for x (T <= 256, K) float32; collect() returns the (T, N_down)
@@ -157,20 +163,20 @@ class NpuQGemm:
         r2 = self.kern.start(bo_act, self.q.mats[down][0]["bo_w"], bo_c, program=dprog)
         self.npu_ms += (time.perf_counter() - t0) * 1e3
         self.calls += 2
-        return len(x), [(gprog, r1), (dprog, r2)], [(D, bo_c, False)]
+        return len(x), [(gprog, r1), (dprog, r2)], [(D, bo_c, False)], None
 
     def collect(self, pending) -> np.ndarray:
         """Wait for a submitted call; returns its result, a view of the call's buffers."""
         t0 = time.perf_counter()
-        T, runs, reads = pending
+        T, runs, reads, y = pending
         for prog, r in runs:
             finish(r, prog)
         outs = []
         for N, bo_c, glu in reads:
             bo_c.sync(FROM_DEV, T * N * 4, 0)
-            y = mapped(bo_c, np.float32)[: T * N].reshape(T, N)
-            outs.append(deinterleave(y) if glu else y)
-        y = np.concatenate(outs, axis=1) if len(outs) > 1 else outs[0]
+            c = mapped(bo_c, np.float32)[: T * N].reshape(T, N)
+            outs.append(deinterleave(c) if glu else c)
+        y = outs[0] if y is None else np.concatenate(outs, axis=1, out=y)
         self.npu_ms += (time.perf_counter() - t0) * 1e3
         return y
 

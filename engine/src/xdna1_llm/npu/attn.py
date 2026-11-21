@@ -72,6 +72,7 @@ class NpuAttn:
         if self.swa:
             self.kern.add_program("attn_swa", os.path.join(kdir, "attn_swa.bin"))
         self.bufs = [self._buffers() for _ in range(2)]  # used in turn: one is filled while the NPU reads the other
+        self.outs: list[np.ndarray] = []  # run()'s results, one per chunk, reused (a fresh 2 MB array page-faults)
         self.pool = ThreadPoolExecutor(THREADS, thread_name_prefix="attn")
         self.npu_ms, self.calls = 0.0, 0
 
@@ -146,17 +147,20 @@ class NpuAttn:
         bo_q.sync(TO_DEV)
         return self.kern.start(bo_q, bo_kv, bo_o, program=prog), bo_kv
 
-    def _result(self, buf, T: int) -> np.ndarray:
+    def _result(self, buf, T: int, j: int) -> np.ndarray:
         _, _, _, bo_o, o = buf
         bo_o.sync(FROM_DEV, T * HEADS * OD * 4, 0)
-        out = np.empty((T, HEADS, HD), np.float32)
+        if j == len(self.outs):
+            self.outs.append(np.empty((ROWS, HEADS, HD), np.float32))
+        out = self.outs[j][:T]
         self._split(lambda a, b: np.divide(o[a:b, :, :HD], o[a:b, :, HD : HD + 1], out=out[a:b]), T)
         return out
 
     def run(self, st, i: int, chunks: list[tuple[np.ndarray, int, str]], window: int) -> list[np.ndarray]:
         """Attention of a layer's chunks [(q, p0, program)], in position order: q (T <= 256, 16 heads, 128;
         scaled by 1 / sqrt(128)) at positions p0 .. p0 + T - 1 over layer i's keys in st up to p0 + T - 1 (all
-        already written there); program from program(). Returns each chunk's (T, 16, 128) fp32."""
+        already written there); program from program(). Returns each chunk's (T, 16, 128) fp32, valid until the
+        next call."""
         t0 = time.perf_counter()
         kv = self._kv(st, i)
         kv.valid = min(kv.valid, chunks[0][1])  # these chunks' keys were just written
@@ -167,10 +171,10 @@ class NpuAttn:
             run = self._start(self.bufs[j % 2], kv, q, p0, prog, window)
             if prev is not None:
                 finish(prev[0][0], "attention")
-                outs.append(self._result(self.bufs[(j - 1) % 2], prev[1]))
+                outs.append(self._result(self.bufs[(j - 1) % 2], prev[1], j - 1))
             prev = run, len(q)
         finish(prev[0][0], "attention")
-        outs.append(self._result(self.bufs[(len(chunks) - 1) % 2], prev[1]))
+        outs.append(self._result(self.bufs[(len(chunks) - 1) % 2], prev[1], len(chunks) - 1))
         self.npu_ms += (time.perf_counter() - t0) * 1e3
         self.calls += len(chunks)
         return outs
