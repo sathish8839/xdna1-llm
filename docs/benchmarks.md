@@ -243,6 +243,13 @@ on it. Two contexts in all. Before it, prompts ran on the bf16 GEMM (section 4) 
   on split operands, makes the epilogue nearly free: 9.7–10.6 ms. Most of what remains is the act write:
   each core's 16 act columns are only 32 bytes per row in DDR, and the other 3/4 of the stream go to a scratch
   region. The kernel alone matches numpy to 1.4e-3 of the largest output.
+* **CPU ops between the calls (fast day, 820 tokens):** the 3.33 s prompt spent 1.8 s in the GEMM calls and
+  1.45 s in numpy: 0.85 s attention, ~0.44 s norms and residuals, 0.22 s short conv. Three rewrites, same math:
+  attention per kv head (its 4 query heads as one matmul, no repeated K/V, contiguous operands, softmax in
+  place) on 4 threads, 2–3x faster; RMSNorm with one `einsum` for the sum of squares, 2.5x; the conv's 7 taps
+  accumulated in place, 1.9x. CPU 1.45 → 0.79 s, prompt **3.33 → 2.65 s (247 → 309 tok/s)**, three
+  alternating rounds each. KLD against the CPU unchanged (0.00005 prompt, 0.00003 decode); decode speed and
+  output unchanged. The GEMM calls are now two thirds of a prompt.
 * Chunks shorter than 32 tokens stay on the GEMV: the GEMM always computes 256 rows, which takes about as long
   as ~25 single-token steps.
 * The weight cache now holds only the GEMV tiles, 1.2 GB instead of 3.9 GB. Loading Q4_K_M through

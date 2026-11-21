@@ -26,6 +26,10 @@ All notable changes to this project are documented here. The format follows
   sets must be rebuilt.
 - Each decode GEMV keeps one prebuilt XRT run and starts it again (`Kernel.prepare`) instead of building a run
   per call: ~0.025 ms less per call, ~10 % faster generation on its own.
+- Faster CPU ops between a prompt's GEMM calls (`xdna1_llm.models.lfm3`): attention runs per kv head on 4
+  threads without repeating K and V, RMSNorm takes one pass for the sum of squares, and the short conv
+  accumulates in place. CPU time of an 820-token Q4_K_M prompt 1.45 → 0.79 s; the prompt 3.33 → 2.65 s
+  (247 → 309 tok/s, alternating runs). Same KLD; decode unchanged.
 
 ## [0.2.0] - 2026-11-21
 

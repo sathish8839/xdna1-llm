@@ -82,7 +82,7 @@ That is **1.6× faster and 2.5× less energy than the CPU, with the CPU nearly f
 | Prefill with every linear layer on the NPU (bf16) | ✅ |
 | Native tokenizer and chat template (identical to llama.cpp / the Jinja template), generation with sampling | ✅ |
 | Decode on the NPU (KV cache): **Q4_K_M** ~17 tok/s, or **Q6_K** ~14–15 tok/s at near-BF16 accuracy | ✅ |
-| Batched prompt on the NPU, reading the 4-bit weights directly (W4A16): ~200 tok/s, no extra RAM | ✅ |
+| Batched prompt on the NPU, reading the 4-bit weights directly (W4A16): ~250–300 tok/s, no extra RAM | ✅ |
 | Accuracy harness: perplexity and KL divergence vs BF16; NPU engine adds ~0 on top of the GGUF | ✅ |
 | OpenAI-compatible server (streaming, thinking, tool calls), ~14 tok/s through the OpenAI SDK | ✅ |
 | Windows app: streaming markdown chat, thinking toggle, DuckDuckGo web search, five themes, NPU status and speed | ✅ |

@@ -23,6 +23,7 @@ bf16 GEMM, which makes a bf16 copy of every linear weight at load).
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
 import numpy as np
@@ -32,11 +33,22 @@ from ..gguf_weights import dequantize
 EPS, LCONV, SWA_WINDOW = 1e-5, 7, 256
 CHUNK = 256  # prefill rows per pass (the bf16 GEMM's tile)
 PREFILL_MIN = 32  # shorter prompt chunks run on `lin`: the GEMM always computes 256 rows
+_pool = None  # prompt attention runs one thread per kv head (numpy releases the GIL)
+
+
+def _threads():
+    global _pool
+    if _pool is None:
+        _pool = ThreadPoolExecutor(4, thread_name_prefix="lfm3")
+    return _pool
 
 
 def rms(x, w):
     x = x.astype(np.float32, copy=False)
-    return x / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + EPS) * w
+    inv = 1.0 / np.sqrt(np.einsum("...i,...i->...", x, x) / np.float32(x.shape[-1]) + np.float32(EPS))
+    out = x * inv[..., None].astype(np.float32)
+    out *= w
+    return out
 
 
 def silu(x):
@@ -181,9 +193,11 @@ class LFM3:
         z = Bg * X
         wc = self.p[b + "conv"]
         zp = np.concatenate([st.conv[i], z], 0)  # the previous 6 inputs, then this chunk's
-        y = np.zeros_like(z)
-        for k in range(LCONV):
-            y += wc[:, k][None, :] * zp[k : k + z.shape[0]]
+        T = z.shape[0]
+        y, tmp = zp[:T] * wc[:, 0], np.empty_like(z)
+        for k in range(1, LCONV):
+            np.multiply(zp[k : k + T], wc[:, k], out=tmp)
+            y += tmp
         st.conv[i] = zp[-(LCONV - 1) :]
         g = Cg * y
         self.cpu_ms += (time.perf_counter() - t0) * 1e3
@@ -200,20 +214,27 @@ class LFM3:
         st.k[i][p0 : p0 + T] = apply_rope(k, cos, sin)
         st.v[i][p0 : p0 + T] = qkv[:, (nh + nkv) * hd :].reshape(T, nkv, hd)
         lo = max(0, p0 - self.window + 1) if kind == "swa" else 0  # earlier keys are outside every query's window
-        rep = nh // nkv
-        k = np.repeat(st.k[i][lo : p0 + T], rep, axis=1)  # (L, nh, hd)
-        v = np.repeat(st.v[i][lo : p0 + T], rep, axis=1)
-        s = np.matmul(q.transpose(1, 0, 2), k.transpose(1, 2, 0)) * np.float32(1.0 / np.sqrt(hd))
-        i_pos, j_pos = p0 + np.arange(T)[:, None], lo + np.arange(k.shape[0])[None, :]
+        rep, K, V = nh // nkv, st.k[i][lo : p0 + T], st.v[i][lo : p0 + T]
+        i_pos, j_pos = p0 + np.arange(T)[:, None], lo + np.arange(K.shape[0])[None, :]
         mask = j_pos > i_pos
         if kind == "swa":
             mask |= (i_pos - j_pos) >= self.window
-        s = np.where(mask[None], -np.inf, s)
-        s = np.exp(s - s.max(-1, keepdims=True))
-        s /= s.sum(-1, keepdims=True)
-        o = np.matmul(s, v.transpose(1, 0, 2)).transpose(1, 0, 2)
+        add = np.where(mask, np.float32(-np.inf), np.float32(0))
+        o = np.empty((T, nkv, rep, hd), np.float32)
+
+        def group(g):  # the rep query heads that share kv head g
+            qg = np.ascontiguousarray(q[:, g * rep : (g + 1) * rep].transpose(1, 0, 2))  # (rep, T, hd)
+            qg *= np.float32(1.0 / np.sqrt(hd))
+            s = np.matmul(qg, np.ascontiguousarray(K[:, g].T))  # (rep, T, L)
+            s += add
+            s -= s.max(-1, keepdims=True)
+            np.exp(s, out=s)
+            s /= s.sum(-1, keepdims=True)
+            o[:, g] = np.matmul(s, np.ascontiguousarray(V[:, g])).transpose(1, 0, 2)
+
+        list(_threads().map(group, range(nkv)))
         gate = 1.0 / (1.0 + np.exp(-(u @ self.p[b + "gate"].T)))
-        o = (o * gate[:, :, None]).reshape(T, nh * hd)
+        o = (o.reshape(T, nh, hd) * gate[:, :, None]).reshape(T, nh * hd)
         self.cpu_ms += (time.perf_counter() - t0) * 1e3
         return self.cur(b + "o", o)
 
