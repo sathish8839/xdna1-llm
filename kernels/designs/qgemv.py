@@ -33,6 +33,7 @@ LANES, RB = 8, 16  # lanes, rows per block
 K_MAX = 7680  # must match qgemv.cc
 # geometry -> (tile bytes, columns per tile for Q4_K, for Q6_K); must match xdna1_llm.q4k.GEOMETRIES
 GEOMETRIES = {"unified": (10944, 1024, 768), "q6only": (7296, 512, 512)}
+SB_BYTES = {4: 2688, 6: 3648}  # bytes per super-block of 16 rows; must match xdna1_llm.q4k.SB_BYTES
 SRC = str(Path(__file__).parent / "qgemv.cc")
 
 
@@ -80,8 +81,19 @@ def qgemv(W: In, X: In, Y: Out, *, Q: CompileTime[int], N: CompileTime[int], K: 
         hdr = Buffer(type=hdr_ty, name=f"h{lane}")
         workers.append(Worker(core_fn, [fin.cons(), fout.prod(), xbuf, hdr, load_x, rows], tile=Tile(col=col, row=row)))
 
-    n_bytes = N // RB * n_tiles * tile_bytes
-    w_taps = TensorAccessPattern.full((n_bytes,)).partition(LANES)
+    # Q4_K tiles are 4 super-blocks (10752 bytes) back to back, shorter than the tile_bytes the cores take:
+    # each lane reads tile_bytes per tile at the format's stride (the overrun is the next tile's start, which
+    # the core ignores, and the host pads the buffer), in pieces of one Q6_K super-block (<= 1023 words per dim).
+    tq = (kc4 if Q == 4 else kc6) // 256 * SB_BYTES[Q]
+    lane_tiles = N // RB // LANES * n_tiles
+    n_bytes = N // RB * n_tiles * tq + tile_bytes
+    piece = SB_BYTES[6]
+    w_taps = [
+        TensorAccessPattern(
+            (n_bytes,), lane * lane_tiles * tq, [lane_tiles, tile_bytes // piece, piece], [tq, piece, 1]
+        )
+        for lane in range(LANES)
+    ]
     y_taps = TensorAccessPattern.full((N,)).partition(LANES)
 
     def sequence(w, x, y, in_hs, out_hs):

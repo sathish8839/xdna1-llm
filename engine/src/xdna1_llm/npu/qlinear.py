@@ -81,7 +81,7 @@ class NpuQLinear:
             make = partial(mod.repack, raw, self.geo)
             tiles = self.cache.get(f"gemv-{self.geo.name}/{name}.{g}", make) if self.cache else make()
             self.repack_s += time.perf_counter() - t0
-            bo_w = self.npu.bo(tiles.nbytes, self.kern.group(0))
+            bo_w = self.npu.bo(tiles.nbytes + self.geo.slack, self.kern.group(0))  # tiles are read past their end
             bo_w.write(tiles.tobytes(), 0)
             bo_w.sync(TO_DEV)
             bo_y = self.npu.bo(N * 4, self.kern.group(2))

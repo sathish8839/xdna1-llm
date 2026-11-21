@@ -10,16 +10,19 @@
 // The geometry is a build option (xdna1_llm.q4k.Geometry): the unified build sizes both formats to (nearly) the
 // same tile so a Q4_K_M model runs in one program; the q6only build uses 512-column Q6_K tiles, which divide
 // LFM3's K = 2048 and 7680, so no padding is streamed. A row of K columns takes ceil(K / KC) tiles; the last one
-// may be partly used. Inside a tile (xdna1_llm/q4k.py and q6k.py write this):
-//   Q4_K: nibbles   KC4/2 x 16 B: chunk p holds q[i, 2p] | q[i, 2p+1] << 4 for rows i = 0..15
+// may be partly used. A tile holds super-blocks of 256 columns, SB4 / SB6 bytes each, back to back in memory
+// across tiles too (the W4A16 GEMM streams them one at a time). The core always receives TILE_BYTES, so a
+// shorter Q4_K tile arrives with the start of the next one after it, which it ignores. Each super-block
+// (xdna1_llm/q4k.py and q6k.py write this):
+//   Q4_K: nibbles   128 x 16 B: chunk p holds q[i, 2p] | q[i, 2p+1] << 4 for rows i = 0..15
 //         groups    per 32 k: sc[16], mn[16] (bf16, small integers, exact)
-//         blocks    per 256 k: d_hi[16], d_lo[16], dmin_hi[16], dmin_lo[16] (bf16, hi + lo == the fp16 exactly)
-//   Q6_K: nibbles   KC6/2 x 16 B: the low 4 bits, as above
-//         high bits KC6/16 x 64 B: byte i (row i % 16, j = i / 16) holds the high 2 bits of k = 2j, 2j+1,
+//         d         d_hi[16], d_lo[16], dmin_hi[16], dmin_lo[16] (bf16, hi + lo == the fp16 exactly)
+//   Q6_K: nibbles   128 x 16 B: the low 4 bits, as above
+//         high bits per 16 k, 64 B: byte i (row i % 16, j = i / 16) holds the high 2 bits of k = 2j, 2j+1,
 //                   8+2j, 9+2j (relative to the group's 16 k) in bits 0-1, 2-3, 4-5, 6-7: the lane order of the
 //                   two 64-byte nibble vectors of the group, so merging needs no shuffles
 //         groups    per 16 k: sc[16] (bf16)
-//         blocks    per 256 k: d_hi[16], d_lo[16]
+//         d         d_hi[16], d_lo[16]
 // x arrives first, over X_TILES tiles: x as bf16 from byte 0, and a header in the last 16 bytes of the last tile:
 // [16-row blocks for this lane, tiles per block, format (4 or 6), K].
 //
@@ -45,6 +48,8 @@
 #define X_TILES ((2 * K_MAX + TILE_BYTES - 1) / TILE_BYTES)
 #define RB 16
 #define QK 256
+#define SB4 2688  // bytes per super-block (xdna1_llm.q4k.SB_BYTES); a Q4_K tile is shorter than TILE_BYTES
+#define SB6 3648
 
 extern "C" {
 
@@ -129,16 +134,16 @@ static inline aie::vector<float, 16> sum4(v16accfloat a0, v16accfloat a1, v16acc
 }
 
 static inline accf16_t q4_tile(const uint8_t *__restrict w, const bfloat16 *__restrict x, accf16_t acc_y, int nsb) {
-  const bfloat16 *__restrict scm = (const bfloat16 *)(w + KC4 / 2 * RB);
-  const bfloat16 *__restrict dd = scm + KC4 / 32 * 2 * RB;
   const aie::vector<uint8_t, 64> m0f = aie::broadcast<uint8_t, 64>(0x0F);
   const int g0 = qg_chunk * (KC4 / 32);
   for (int b = 0; b < nsb; b++) {
+    const uint8_t *__restrict wb = w + b * SB4;
+    const bfloat16 *__restrict scm = (const bfloat16 *)(wb + QK / 2 * RB);
     accf16_t acc_s = aie::zeros<accfloat, 16>(), acc_m = acc_s;  // sum of sc * dot, mn * xsum
     _Pragma("clang loop unroll_count(2)")
     for (int gb = 0; gb < 8; gb++) {
       const int gc = b * 8 + gb, g = g0 + gc;
-      const uint8_t *__restrict wg = w + gc * 16 * RB;
+      const uint8_t *__restrict wg = wb + gb * 16 * RB;
       const bfloat16 *__restrict xg = x + g * 32;
       v16accfloat a[4];
       _Pragma("clang loop unroll(full)")
@@ -151,12 +156,12 @@ static inline accf16_t q4_tile(const uint8_t *__restrict w, const bfloat16 *__re
       }
       vbf16_t dot_hi, dot_lo;
       split(aie::sub(sum4(a[0], a[1], a[2], a[3]), qg_xoff[g]), dot_hi, dot_lo);
-      vbf16_t sc = aie::load_v<16>(scm + gc * 2 * RB), mn = aie::load_v<16>(scm + gc * 2 * RB + RB);
+      vbf16_t sc = aie::load_v<16>(scm + gb * 2 * RB), mn = aie::load_v<16>(scm + gb * 2 * RB + RB);
       acc_s = aie::mac(aie::mac(acc_s, sc, dot_hi), sc, dot_lo);
       acc_m = aie::mac(aie::mac(acc_m, mn, qg_xs_hi[g]), mn, qg_xs_lo[g]);
     }
     // y += d * S - dmin * M (the lo * lo terms are below fp32 rounding)
-    const bfloat16 *__restrict db = dd + b * 4 * RB;
+    const bfloat16 *__restrict db = scm + 8 * 2 * RB;
     vbf16_t d_hi = aie::load_v<16>(db), d_lo = aie::load_v<16>(db + RB);
     vbf16_t dm_hi = aie::load_v<16>(db + 2 * RB), dm_lo = aie::load_v<16>(db + 3 * RB);
     vbf16_t s_hi, s_lo, m_hi, m_lo;
@@ -169,21 +174,22 @@ static inline accf16_t q4_tile(const uint8_t *__restrict w, const bfloat16 *__re
 }
 
 static inline accf16_t q6_tile(const uint8_t *__restrict w, const bfloat16 *__restrict x, accf16_t acc_y, int nsb) {
-  const uint8_t *__restrict hbits = w + KC6 / 2 * RB;
-  const bfloat16 *__restrict scv = (const bfloat16 *)(hbits + KC6 / 8 * 32);
-  const bfloat16 *__restrict dd = scv + KC6 / 16 * RB;
   const aie::vector<uint8_t, 64> m0f = aie::broadcast<uint8_t, 64>(0x0F), m30 = aie::broadcast<uint8_t, 64>(0x30);
   const int g0 = qg_chunk * (KC6 / 16);
   for (int b = 0; b < nsb; b++) {
+    const uint8_t *__restrict wb = w + b * SB6;
+    const uint8_t *__restrict hbits = wb + QK / 2 * RB;
+    const bfloat16 *__restrict scv = (const bfloat16 *)(hbits + QK / 16 * 64);
+    const bfloat16 *__restrict dd = scv + QK / 16 * RB;
     accf16_t acc_s = aie::zeros<accfloat, 16>();  // sum of sc * dot
     _Pragma("clang loop unroll_count(2)")
     for (int gb = 0; gb < 16; gb++) {
       const int gc = b * 16 + gb, g = g0 + gc;
       const bfloat16 *__restrict xg = x + g * 16;
       // 16 k x 16 rows: n0 holds k 0-7 (lanes: k pair j = 0..3, then row), n1 k 8-15, h their high bits
-      const uint8_t *__restrict wg = w + gc * 8 * RB;
+      const uint8_t *__restrict wg = wb + gb * 8 * RB;
       const aie::vector<uint8_t, 64> n0 = aie::load_v<64>(wg), n1 = aie::load_v<64>(wg + 64);
-      const aie::vector<uint8_t, 64> h = aie::load_v<64>(hbits + gc * 64);
+      const aie::vector<uint8_t, 64> h = aie::load_v<64>(hbits + gb * 64);
       aie::vector<bfloat16, 32> e0a, e0b, o0a, o0b, e1a, e1b, o1a, o1b;  // even / odd k, lanes 0-31 / 32-63
       to_bf16_zip(aie::bit_or(aie::bit_and(n0, m0f), aie::bit_and(aie::upshift(h, 4), m30)), e0a, e0b);
       to_bf16_zip(aie::bit_or(aie::downshift(n0, 4), aie::bit_and(aie::upshift(h, 2), m30)), o0a, o0b);
@@ -194,10 +200,10 @@ static inline accf16_t q6_tile(const uint8_t *__restrict w, const bfloat16 *__re
       const v16accfloat a2 = quad(z, e1a, o1a, xg + 8), a3 = quad(z, e1b, o1b, xg + 12);
       vbf16_t dot_hi, dot_lo;
       split(aie::sub(sum4(a0, a1, a2, a3), qg_xoff[g]), dot_hi, dot_lo);
-      vbf16_t sc = aie::load_v<16>(scv + gc * RB);
+      vbf16_t sc = aie::load_v<16>(scv + gb * RB);
       acc_s = aie::mac(aie::mac(acc_s, sc, dot_hi), sc, dot_lo);
     }
-    vbf16_t d_hi = aie::load_v<16>(dd + b * 2 * RB), d_lo = aie::load_v<16>(dd + b * 2 * RB + RB);
+    vbf16_t d_hi = aie::load_v<16>(dd), d_lo = aie::load_v<16>(dd + RB);
     vbf16_t s_hi, s_lo;
     split(acc_s.to_vector<float>(), s_hi, s_lo);
     acc_y = aie::mac(aie::mac(aie::mac(acc_y, d_hi, s_hi), d_hi, s_lo), d_lo, s_hi);

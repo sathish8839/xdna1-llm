@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 from gguf import GGMLQuantizationType
 from gguf.quants import dequantize as gguf_dequantize
+from test_q4k import by_section
 
 from xdna1_llm import q4k, q6k
 from xdna1_llm.bf16 import from_bf16
@@ -20,7 +21,7 @@ def unpack_tiles(tiles: np.ndarray, n: int, k: int, geo=q4k.UNIFIED) -> np.ndarr
     """Read the kernel's tile layout back into float weights (what qgemv.cc computes, in numpy)."""
     KC, nc = q6k.layout(k, geo)
     RB, kp = q6k.RB, nc * KC
-    t = tiles.reshape(n // RB, nc, geo.tile)
+    t = by_section(tiles, n, nc, 6, [2048, 1024, 512, 64], geo)
     nib = t[..., : KC * 8].reshape(*t.shape[:2], KC // 2, RB)
     lo = np.stack([nib & 0x0F, nib >> 4], axis=-1)  # (block, chunk, k pair, row, k in pair)
     lo = lo.transpose(0, 3, 1, 2, 4).reshape(n, kp)

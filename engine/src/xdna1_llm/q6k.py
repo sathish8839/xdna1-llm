@@ -47,13 +47,14 @@ def layout(K: int, geo: q4k.Geometry = q4k.UNIFIED) -> tuple[int, int]:
 
 
 def repack(raw: np.ndarray, geo: q4k.Geometry = q4k.UNIFIED) -> np.ndarray:
-    """Q6_K rows, uint8 (N, K/256*210) -> kernel tiles, ordered (16-row block, k chunk). Each tile:
+    """Q6_K rows, uint8 (N, K/256*210) -> kernel tiles, ordered (16-row block, k chunk). Each tile holds
+    super-blocks of 256 columns, q4k.SB_BYTES[6] each:
     low nibbles: per k pair, 16 bytes (row i: q[2p] & 15 | (q[2p+1] & 15) << 4), as in the Q4_K tiles
     high bits:   per 16 k, 64 bytes; byte i (row i % 16, j = i // 16) holds the high 2 bits of
                  k = 2j, 2j+1, 8+2j, 9+2j in bits 0-1, 2-3, 4-5, 6-7 (the lane order of 64-byte nibble loads)
     scales:      per 16 k, sc for 16 rows (bf16, exact)
-    super-block: d_hi, d_lo for 16 rows (bf16, d_hi + d_lo == d exactly)
-    then zero padding to the tile size. Columns past K are zero."""
+    d:           d_hi, d_lo for 16 rows (bf16, d_hi + d_lo == d exactly)
+    Columns past K are zero."""
     q, sc, d = unpack(raw)
     N, K = q.shape
     KC, nc = layout(K, geo)
@@ -72,4 +73,4 @@ def repack(raw: np.ndarray, geo: q4k.Geometry = q4k.UNIFIED) -> np.ndarray:
 
     scv = q4k.rows_last([to_bf16(sc.astype(np.float32))], nb, nc, KC // G)
     dd = q4k.rows_last([*q4k._hi_lo(d)], nb, nc, KC // QK)
-    return q4k.pad_tiles([nib.reshape(nb, nc, -1), hb.reshape(nb, nc, -1), scv, dd], geo)
+    return q4k.sb_tiles([nib.reshape(nb, nc, -1), hb.reshape(nb, nc, -1), scv, dd], 6, geo)

@@ -1,5 +1,7 @@
 """Q4_K unpacking and the NPU tile layout, checked against the gguf package's reference dequantizer."""
 
+import itertools
+
 import numpy as np
 import pytest
 from gguf import GGMLQuantizationType
@@ -18,11 +20,19 @@ def random_q4k(n: int, k: int, seed: int = 0) -> np.ndarray:
     return raw.reshape(n, -1)
 
 
+def by_section(tiles: np.ndarray, n: int, nc: int, fmt: int, sizes: list[int], geo=q4k.UNIFIED) -> np.ndarray:
+    """Tiles of super-blocks, each holding sections of `sizes` bytes -> (blocks, chunks, bytes) with each
+    section's bytes from all of a tile's super-blocks together."""
+    sb = tiles.reshape(n // q4k.RB, nc, geo.kc(fmt) // q4k.QK, q4k.SB_BYTES[fmt])
+    ends = np.cumsum([0, *sizes])
+    return np.concatenate([sb[..., a:b].reshape(*sb.shape[:2], -1) for a, b in itertools.pairwise(ends)], axis=2)
+
+
 def unpack_tiles(tiles: np.ndarray, n: int, k: int) -> np.ndarray:
     """Read the kernel's tile layout back into float weights (what qgemv.cc computes, in numpy)."""
     KC, nc = q4k.layout(k, 4)
     ngc, nsc, kp = KC // q4k.G, KC // q4k.QK, nc * KC
-    t = tiles.reshape(n // q4k.RB, nc, q4k.TILE_BYTES)
+    t = by_section(tiles, n, nc, 4, [2048, 512, 128])
     nib = t[..., : KC * 8].reshape(*t.shape[:2], KC // 2, q4k.RB)
     q = np.stack([nib & 0x0F, nib >> 4], axis=-1).transpose(0, 3, 1, 2, 4).reshape(n, kp)  # (row, k)
     rest = t[..., KC * 8 :].copy().view(np.uint16)
@@ -48,7 +58,7 @@ def test_repack_is_lossless(k):
     n = 32
     raw = random_q4k(n, k, seed=k)
     tiles = q4k.repack(raw)
-    assert tiles.size == n // q4k.RB * q4k.layout(k)[1] * q4k.TILE_BYTES
+    assert tiles.size == n // q4k.RB * q4k.layout(k)[1] * q4k.UNIFIED.tile_bytes(4)
     np.testing.assert_array_equal(unpack_tiles(tiles, n, k), q4k.dequantize(raw))
 
 
