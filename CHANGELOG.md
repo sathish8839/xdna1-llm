@@ -5,6 +5,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-21
+
+The first release: LiquidAI LFM3-1.7B on the XDNA1 NPU of Ryzen 7040 / 8040 / Ryzen 200 laptops, on Windows.
+Prompt processing and generation run on the NPU (Q4_K_M ~15 tok/s, Q6_K ~12–13 tok/s) and match a CPU
+reference. It comes as a Windows chat app with an installer that downloads the model on first run, and as an
+OpenAI-compatible local server. Tested on one laptop (Ryzen 7 250) with NPU driver 32.0.203.297.
+
 ### Added
 
 - App themes (Theme menu, saved): Windows (native, the default), Silicon (an NPU panel with a tile per streamed
@@ -57,9 +64,6 @@ All notable changes to this project are documented here. The format follows
   identical to llama.cpp token for token (`benchmarks/check_tokenizer.py`). Chat template in Python
   (`xdna1_llm.chat`: thinking, tools, tool results), identical to the GGUF's Jinja template. `xdna1-llm --chat`
   streams text, stops at end of turn and needs no llama-server.
-- Fixed: `eval_quality.py` started every chunk with the text's first token instead of BOS (llama.cpp adds no
-  BOS for LFM3); accuracy numbers re-measured.
-
 - NPU runtime for XDNA1 (npu1) on Windows through pyxrt from the XRT Windows SDK.
 - Chunked bf16 GEMM engine: every LFM3-1.7B linear layer runs on the NPU (prefill up to 256 tokens).
 - LFM3 model (short conv, GQA attention with sliding window, SwiGLU) loading BF16 GGUF weights; output matches
@@ -91,3 +95,11 @@ All notable changes to this project are documented here. The format follows
   the real LM head runs in 9.5 ms. Q4_K and Q6_K share one design script (`qgemv.py`).
 - 4-bit GEMV on GGUF Q4_K weights, repacked losslessly at load (`xdna1_llm/q4k.py`): long rows split across
   tiles, outputs streamed per 16 rows, 15–44 G weights/s on LFM3 shapes, ~1e-4 from the GGUF dequantization.
+
+### Fixed
+
+- `eval_quality.py` started every chunk with the text's first token instead of BOS (llama.cpp adds no BOS for
+  LFM3); accuracy numbers re-measured.
+
+[Unreleased]: https://github.com/sathish8839/xdna1-llm/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/sathish8839/xdna1-llm/releases/tag/v0.1.0

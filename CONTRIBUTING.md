@@ -3,11 +3,10 @@
 Issues and pull requests are welcome.
 
 **Test reports are the most useful contribution right now.** If you have an XDNA1 laptop (Ryzen 7040, 8040 or
-Ryzen 200 series), run the tests and open an issue that includes:
-
-- your processor,
-- your NPU driver version (Device Manager → Neural processors → Driver), and
-- the output of `pytest -rs`.
+Ryzen 200 series), install the app and fill in a
+[hardware report](https://github.com/sathish8839/xdna1-llm/issues/new?template=hardware-report.yml): your
+processor, NPU driver version, whether it worked and how fast. From a source checkout, add the output of
+`pytest -rs`.
 
 ## Development
 

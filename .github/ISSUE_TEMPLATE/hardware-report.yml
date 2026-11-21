@@ -1,0 +1,75 @@
+name: Hardware report
+description: Tell us how xdna1-llm runs (or doesn't) on your laptop.
+title: "Hardware report: <processor>"
+labels: ["hardware-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing. Reports from other XDNA1 laptops, especially with other NPU drivers, are the most
+        useful thing for this project right now. Failures are as welcome as successes.
+  - type: input
+    id: cpu
+    attributes:
+      label: Processor
+      description: Settings → System → About → Processor.
+      placeholder: AMD Ryzen 7 8840HS
+    validations:
+      required: true
+  - type: input
+    id: driver
+    attributes:
+      label: NPU driver version
+      description: Device Manager → Neural processors → the AMD NPU → Driver tab.
+      placeholder: 32.0.203.297
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      description: Run `winver`.
+      placeholder: Windows 11 24H2, build 26100
+  - type: dropdown
+    id: version
+    attributes:
+      label: How did you run it?
+      options:
+        - Installer (from Releases)
+        - From source
+    validations:
+      required: true
+  - type: dropdown
+    id: model
+    attributes:
+      label: Model
+      options:
+        - LFM3-1.7B Q4_K_M
+        - LFM3-1.7B Q6_K
+        - Other GGUF
+  - type: dropdown
+    id: result
+    attributes:
+      label: Did it work?
+      options:
+        - "Yes"
+        - It started, but replies were wrong or garbled
+        - No, the model did not load
+    validations:
+      required: true
+  - type: input
+    id: speed
+    attributes:
+      label: Speed
+      description: The line under a reply, e.g. "120 tokens · 14.6 tok/s · first token 1.1 s".
+  - type: textarea
+    id: log
+    attributes:
+      label: Error message or log
+      description: |
+        If it failed: the message the app showed, and the end of `%LOCALAPPDATA%\xdna1-llm\engine.log`.
+      render: text
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else

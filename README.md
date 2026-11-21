@@ -14,17 +14,52 @@
 
 Millions of laptops have a first-generation AMD XDNA NPU (Phoenix / Hawk Point, 16 TOPS) that sits idle,
 because today's NPU LLM stacks (FastFlowLM, Lemonade, Ryzen AI OGA and Unsloth's NPU backend) require XDNA 2.
-**xdna1-llm runs LLMs on that NPU instead.** It starts with [LiquidAI LFM3-1.7B](https://huggingface.co/LiquidAI/LFM3-1.7B)
-and aims for the Q4_K_M quant running entirely on the NPU, behind:
+**xdna1-llm runs LLMs on that NPU instead.** It starts with [LiquidAI LFM3-1.7B](https://huggingface.co/LiquidAI/LFM3-1.7B),
+Q4_K_M at ~15 tokens/s, behind:
 
+- a **native Windows chat app** with a thinking toggle, DuckDuckGo web search and five themes, and
 - an **OpenAI-compatible local server**, so you can use it from Open WebUI, Unsloth Studio, IDE plugins or the
-  OpenAI SDKs, and
-- a small **native Windows chat app** with a thinking toggle and DuckDuckGo web search.
+  OpenAI SDKs.
 
-> [!IMPORTANT]
-> **Pre-alpha.** Prefill and token generation (Q4_K_M or Q6_K) run on the NPU and match a CPU reference, with
-> the model's own tokenizer and chat template. An OpenAI-compatible server, a Windows chat app and an installer
-> work; there is no published release yet. See the [roadmap](docs/roadmap.md).
+> [!NOTE]
+> **v0.1, the first release.** Prefill and generation run on the NPU and match a CPU reference. It has been
+> tested on one laptop and one NPU driver, so expect rough edges, and please send a
+> [hardware report](https://github.com/sathish8839/xdna1-llm/issues/new?template=hardware-report.yml).
+
+<p align="center"><img src="docs/images/theme-silicon.png" width="640" alt="The chat app in the Silicon theme, streaming a reply while the NPU panel lights a tile per token"></p>
+
+## Install
+
+1. **Check for the NPU.** Device Manager should list an AMD NPU under **Neural processors**. If it doesn't, install
+   the NPU driver from your PC maker's support page ([more](docs/setup.md#npu-driver)).
+2. **Download** `xdna1-llm-setup-<version>.exe` from [Releases](https://github.com/sathish8839/xdna1-llm/releases).
+3. **Run it.** It installs for your user, without an admin prompt. The installer is not code-signed yet, so
+   Windows SmartScreen may say "Windows protected your PC": click **More info**, then **Run anyway**.
+4. **Open xdna1 chat** from the Start menu and download a model: **Q4_K_M** (1.1 GB, fastest) or **Q6_K**
+   (1.4 GB, closest to the original), or pick a GGUF file you already have. The first load takes about a minute
+   while the weights are converted for the NPU (about 4 GB, kept in `%LOCALAPPDATA%\xdna1-llm\cache`); later
+   loads take about 20 seconds.
+
+Nothing leaves the machine except the model download and, when you turn it on, web search queries to DuckDuckGo.
+
+## The app
+
+**Theme** switches between five looks: Windows (native), Silicon (above), Paper, Console and Spotlight, a small
+always-on-top window that Alt+Space shows or hides from anywhere.
+
+| Paper | Console |
+|---|---|
+| <img src="docs/images/theme-paper.png" width="400" alt="Paper theme: serif reading column"> | <img src="docs/images/theme-console.png" width="400" alt="Console theme: monospace with a streaming caret"> |
+| **Spotlight** | **Windows** |
+| <img src="docs/images/theme-spotlight.png" width="400" alt="Spotlight theme: compact acrylic window with the message box on top"> | <img src="docs/images/theme-windows.png" width="400" alt="Windows theme: native Mica look"> |
+
+## Known issues
+
+- The installer is not code-signed, so SmartScreen warns the first time.
+- Tested on one laptop (Ryzen 7 250) with NPU driver 32.0.203.297. Newer drivers may refuse the NPU kernels;
+  the app then says so in plain words.
+- Only LFM3-1.7B is supported.
+- Spotlight's Alt+Space can't be used while PowerToys Run holds it.
 
 ## Results so far
 
@@ -50,8 +85,8 @@ That is **1.6× faster and 2.5× less energy than the CPU, with the CPU nearly f
 | Batched prompt on the NPU: ~135 tok/s (689 tokens in 5 s) | ✅ |
 | Accuracy harness: perplexity and KL divergence vs BF16; NPU engine adds ~0 on top of the GGUF | ✅ |
 | OpenAI-compatible server (streaming, thinking, tool calls), ~14 tok/s through the OpenAI SDK | ✅ |
-| Windows app: streaming markdown chat, thinking toggle, DuckDuckGo web search, NPU status and speed | ✅ |
-| Installer with prebuilt kernels; the app downloads the model on first run | ✅ |
+| Windows app: streaming markdown chat, thinking toggle, DuckDuckGo web search, five themes, NPU status and speed | ✅ |
+| Installer with prebuilt kernels (built in CI); the app downloads the model on first run | ✅ |
 | Norms, conv, attention and SwiGLU fused on the NPU | ⏳ |
 
 ## Supported hardware
@@ -62,13 +97,14 @@ That is **1.6× faster and 2.5× less energy than the CPU, with the CPU nearly f
 | OS | Windows 11 with the AMD NPU driver (tested: 32.0.203.297) |
 | Memory | 16 GB RAM recommended |
 
-Only a Ryzen 7 250 has been tested so far. **Have one of these laptops? A [test report](CONTRIBUTING.md)
-is the most valuable contribution right now**, especially with newer NPU drivers.
+Only a Ryzen 7 250 has been tested so far. **Have one of these laptops? A
+[hardware report](https://github.com/sathish8839/xdna1-llm/issues/new?template=hardware-report.yml) is the most
+valuable contribution right now**, especially with newer NPU drivers.
 
-## Try it (developers)
+## Build from source
 
-There is no published release yet; `installer\build-installer.ps1` builds the installer from a checkout. To work
-on the engine you need the XRT SDK, plus WSL to build the kernels. The full guide is in
+`installer\build-installer.ps1` builds the installer from a checkout, and the release workflow builds it, kernels
+included, in CI. To work on the engine you need the XRT SDK, plus WSL to build the kernels. The full guide is in
 [docs/setup.md](docs/setup.md).
 
 ```powershell
@@ -99,7 +135,9 @@ weights once, and streams every projection through them in 1024-wide chunks. Det
 ## Repository layout
 
 ```
-engine/       Python engine: xdna1_llm package (npu runtime, models, GGUF, CLI) and tests
+engine/       Python engine: xdna1_llm package (npu runtime, models, GGUF, server, CLI) and tests
+app/          Windows chat app (WinUI 3, C#)
+installer/    portable build and Inno Setup installer
 kernels/      scripts that build the npu1 kernels with mlir-aie (in WSL or Linux)
 benchmarks/   GEMM shape, context-switch and power benchmarks
 docs/         setup, architecture, benchmarks, roadmap
