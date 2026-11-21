@@ -33,13 +33,14 @@ from ..gguf_weights import dequantize
 EPS, LCONV, SWA_WINDOW = 1e-5, 7, 256
 CHUNK = 256  # prefill rows per pass (the bf16 GEMM's tile)
 PREFILL_MIN = 32  # shorter prompt chunks run on `lin`: the GEMM always computes 256 rows
-_pool = None  # prompt attention runs one thread per kv head (numpy releases the GIL)
+THREADS = 8  # prompt attention: one task per query head (numpy releases the GIL); 8 beat 4 and 16 on 8 cores
+_pool = None
 
 
 def _threads():
     global _pool
     if _pool is None:
-        _pool = ThreadPoolExecutor(4, thread_name_prefix="lfm3")
+        _pool = ThreadPoolExecutor(THREADS, thread_name_prefix="lfm3")
     return _pool
 
 
@@ -72,7 +73,8 @@ def apply_rope(x, cos, sin):  # x (T, H, D)
 
 
 class State:
-    """Decode state: the position, per attention layer the keys/values so far, per conv layer the last 6 inputs.
+    """Decode state: the position, per attention layer the keys/values so far (kv head, position, head dim: each
+    head's keys are one contiguous matrix), per conv layer the last 6 inputs.
 
     A state can go back to an earlier position, to reuse a shared prefix (the next chat turn starts with this
     one). Attention needs nothing for that: keys/values past the position are overwritten. The conv window only
@@ -85,8 +87,8 @@ class State:
             if model.kind(i) == "conv":
                 self.conv[i] = np.zeros((LCONV - 1, model.d), np.float32)
             else:
-                self.k[i] = np.zeros((max_len, model.kv_heads[i], model.hd), np.float32)
-                self.v[i] = np.zeros((max_len, model.kv_heads[i], model.hd), np.float32)
+                self.k[i] = np.zeros((model.kv_heads[i], max_len, model.hd), np.float32)
+                self.v[i] = np.zeros((model.kv_heads[i], max_len, model.hd), np.float32)
         self.snaps = {0: {i: c.copy() for i, c in self.conv.items()}}  # position -> conv windows there
 
     def snapshot(self):
@@ -210,31 +212,29 @@ class LFM3:
         q = rms(qkv[:, : nh * hd].reshape(T, nh, hd), self.p[b + "q_norm"])
         k = rms(qkv[:, nh * hd : (nh + nkv) * hd].reshape(T, nkv, hd), self.p[b + "k_norm"])
         cos, sin = self.rope(kind, T, p0)
-        q = apply_rope(q, cos, sin)
-        st.k[i][p0 : p0 + T] = apply_rope(k, cos, sin)
-        st.v[i][p0 : p0 + T] = qkv[:, (nh + nkv) * hd :].reshape(T, nkv, hd)
+        q = apply_rope(q, cos, sin) * np.float32(1.0 / np.sqrt(hd))
+        st.k[i][:, p0 : p0 + T] = apply_rope(k, cos, sin).transpose(1, 0, 2)
+        st.v[i][:, p0 : p0 + T] = qkv[:, (nh + nkv) * hd :].reshape(T, nkv, hd).transpose(1, 0, 2)
         lo = max(0, p0 - self.window + 1) if kind == "swa" else 0  # earlier keys are outside every query's window
-        rep, K, V = nh // nkv, st.k[i][lo : p0 + T], st.v[i][lo : p0 + T]
-        i_pos, j_pos = p0 + np.arange(T)[:, None], lo + np.arange(K.shape[0])[None, :]
+        rep, K, V = nh // nkv, st.k[i][:, lo : p0 + T], st.v[i][:, lo : p0 + T]  # (nkv, L, hd)
+        i_pos, j_pos = p0 + np.arange(T)[:, None], lo + np.arange(K.shape[1])[None, :]
         mask = j_pos > i_pos
         if kind == "swa":
             mask |= (i_pos - j_pos) >= self.window
         add = np.where(mask, np.float32(-np.inf), np.float32(0))
-        o = np.empty((T, nkv, rep, hd), np.float32)
+        o = np.empty((T, nh, hd), np.float32)
 
-        def group(g):  # the rep query heads that share kv head g
-            qg = np.ascontiguousarray(q[:, g * rep : (g + 1) * rep].transpose(1, 0, 2))  # (rep, T, hd)
-            qg *= np.float32(1.0 / np.sqrt(hd))
-            s = np.matmul(qg, np.ascontiguousarray(K[:, g].T))  # (rep, T, L)
+        def head(h):  # query head h reads kv head h // rep; every operand is a BLAS-ready matrix view
+            s = q[:, h] @ K[h // rep].T  # (T, L)
             s += add
             s -= s.max(-1, keepdims=True)
             np.exp(s, out=s)
             s /= s.sum(-1, keepdims=True)
-            o[:, g] = np.matmul(s, np.ascontiguousarray(V[:, g])).transpose(1, 0, 2)
+            o[:, h] = s @ V[h // rep]
 
-        list(_threads().map(group, range(nkv)))
+        list(_threads().map(head, range(nh)))
         gate = 1.0 / (1.0 + np.exp(-(u @ self.p[b + "gate"].T)))
-        o = (o.reshape(T, nh, hd) * gate[:, :, None]).reshape(T, nh * hd)
+        o = (o * gate[:, :, None]).reshape(T, nh * hd)
         self.cpu_ms += (time.perf_counter() - t0) * 1e3
         return self.cur(b + "o", o)
 
@@ -315,15 +315,15 @@ class LFM3:
         q = rms(qkv[: nh * hd].reshape(1, nh, hd), self.p[b + "q_norm"])
         k = rms(qkv[nh * hd : (nh + nkv) * hd].reshape(1, nkv, hd), self.p[b + "k_norm"])
         cos, sin = self.rope(kind, 1, pos)
-        st.k[i][pos] = apply_rope(k, cos, sin)[0]
-        st.v[i][pos] = qkv[(nh + nkv) * hd :].reshape(nkv, hd)
+        st.k[i][:, pos] = apply_rope(k, cos, sin)[0]
+        st.v[i][:, pos] = qkv[(nh + nkv) * hd :].reshape(nkv, hd)
         q = apply_rope(q, cos, sin)[0].reshape(nkv, nh // nkv, hd)  # GQA: query heads grouped by kv head
         lo = max(0, pos - self.window + 1) if kind == "swa" else 0
-        K, V = st.k[i][lo : pos + 1], st.v[i][lo : pos + 1]  # (L, nkv, hd)
-        s = np.einsum("grd,lgd->grl", q, K) * np.float32(1.0 / np.sqrt(hd))
+        K, V = st.k[i][:, lo : pos + 1], st.v[i][:, lo : pos + 1]  # (nkv, L, hd)
+        s = np.matmul(q, K.transpose(0, 2, 1)) * np.float32(1.0 / np.sqrt(hd))  # (nkv, rep, L)
         s = np.exp(s - s.max(-1, keepdims=True))
         s /= s.sum(-1, keepdims=True)
-        o = np.einsum("grl,lgd->grd", s, V).reshape(nh, hd)
+        o = np.matmul(s, V).reshape(nh, hd)
         gate = 1.0 / (1.0 + np.exp(-(u[0] @ self.p[b + "gate"].T)))
         o = (o * gate[:, None]).reshape(1, nh * hd)
         self.cpu_ms += (time.perf_counter() - t0) * 1e3

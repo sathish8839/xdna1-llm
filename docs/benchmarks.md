@@ -250,6 +250,21 @@ on it. Two contexts in all. Before it, prompts ran on the bf16 GEMM (section 4) 
   accumulated in place, 1.9x. CPU 1.45 → 0.79 s, prompt **3.33 → 2.65 s (247 → 309 tok/s)**, three
   alternating rounds each. KLD against the CPU unchanged (0.00005 prompt, 0.00003 decode); decode speed and
   output unchanged. The GEMM calls are now two thirds of a prompt.
+* **Long prompts:** the GEMM calls grow linearly (~1.8 s per 1K tokens), attention on the CPU with the square
+  of the length (the 6 full-attention layers): 0.5 s at 1K tokens, 1.5 s at 2K, 5.9 s of a 15.4 s 4K-token
+  prompt. Decode slowed too, from 17.5 tok/s after 100 tokens to 10.8 after 4K: its attention used `einsum`
+  over a (position, kv head, dim) cache, 39 ms of CPU per token. With the cache stored per kv head, both
+  attentions take contiguous BLAS operands (decode: batched matmul; prompts: one query head per task, 8
+  threads):
+
+  | 4K tokens, pairs of runs in the same machine state | before | after |
+  |---|---|---|
+  | decode after the prompt | 9.2–10.8 tok/s | **12.5–14.4 tok/s** |
+  | its CPU ops per token | 39–52 ms | 15–21 ms |
+  | prompt attention on the CPU | 5.9–6.8 s | 4.6–5.9 s |
+
+  KLD against the CPU unchanged (0.00003 decode, 0.00005 prompt). At 4K tokens prompt attention is still
+  ~30 % of the prompt and grows fastest: M7's attention design.
 * Chunks shorter than 32 tokens stay on the GEMV: the GEMM always computes 256 rows, which takes about as long
   as ~25 single-token steps.
 * The weight cache now holds only the GEMV tiles, 1.2 GB instead of 3.9 GB. Loading Q4_K_M through

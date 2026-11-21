@@ -30,6 +30,10 @@ All notable changes to this project are documented here. The format follows
   threads without repeating K and V, RMSNorm takes one pass for the sum of squares, and the short conv
   accumulates in place. CPU time of an 820-token Q4_K_M prompt 1.45 → 0.79 s; the prompt 3.33 → 2.65 s
   (247 → 309 tok/s, alternating runs). Same KLD; decode unchanged.
+- The KV cache is stored per kv head (kv head, position, head dim), so attention reads each head's keys as one
+  contiguous matrix: decode attention uses BLAS matmuls instead of `einsum`, and prompt attention runs one
+  query head per task on 8 threads. After a 4K-token prompt, generation 9.2–10.8 → 12.5–14.4 tok/s (CPU ops
+  per token 39–52 → 15–21 ms); prompt attention at 4K tokens 13–23 % faster. Same KLD.
 
 ## [0.2.0] - 2026-11-21
 
