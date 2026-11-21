@@ -78,7 +78,9 @@ class State:
 
     A state can go back to an earlier position, to reuse a shared prefix (the next chat turn starts with this
     one). Attention needs nothing for that: keys/values past the position are overwritten. The conv window only
-    holds the latest inputs, so `snapshot` keeps a copy of it at chosen positions and `rewind` returns to one."""
+    holds the latest inputs, so `snapshot` keeps a copy of it at chosen positions and `rewind` returns to one.
+    NPU attention keeps its own copy of the keys/values on the device (npu_kv); `rewind` marks what it must
+    copy again."""
 
     def __init__(self, model: LFM3, max_len: int):
         self.pos, self.max_len = 0, max_len
@@ -90,6 +92,7 @@ class State:
                 self.k[i] = np.zeros((model.kv_heads[i], max_len, model.hd), np.float32)
                 self.v[i] = np.zeros((model.kv_heads[i], max_len, model.hd), np.float32)
         self.snaps = {0: {i: c.copy() for i, c in self.conv.items()}}  # position -> conv windows there
+        self.npu_kv = {}  # layer -> xdna1_llm.npu.attn.DeviceKV
 
     def snapshot(self):
         """Remember the conv windows at the current position (about 0.6 MB for LFM3-1.7B)."""
@@ -102,15 +105,17 @@ class State:
         p = max(q for q in self.snaps if q <= pos)
         self.conv = {i: c.copy() for i, c in self.snaps[p].items()}
         self.snaps = {q: s for q, s in self.snaps.items() if q <= p}
+        for kv in self.npu_kv.values():
+            kv.valid = min(kv.valid, p)
         self.pos = p
         return p
 
 
 class LFM3:
-    def __init__(self, w, lin, prefill_lin=None):
+    def __init__(self, w, lin, prefill_lin=None, attn=None):
         if w.arch != "lfm3":
             raise ValueError(f"expected an lfm3 GGUF, got {w.arch!r}")
-        self.w, self.lin, self.prefill_lin = w, lin, prefill_lin
+        self.w, self.lin, self.prefill_lin, self.attn = w, lin, prefill_lin, attn
         self.cur = lin  # the backend the running pass uses
         a = "lfm3."
         self.n_layers = int(w.scalar(a + "block_count"))
@@ -205,8 +210,10 @@ class LFM3:
         self.cpu_ms += (time.perf_counter() - t0) * 1e3
         return self.cur(b + "out_proj", g)
 
-    def _attn(self, b, i, u, kind, st):
-        T, nh, hd, nkv, p0 = u.shape[0], self.nh, self.hd, self.kv_heads[i], st.pos
+    def _qkv(self, b, i, u, kind, st, p0):
+        """q/k/v of a chunk at p0: writes its keys and values into st; returns q (scaled by 1 / sqrt(hd)) and
+        the per-head output gate."""
+        T, nh, hd, nkv = u.shape[0], self.nh, self.hd, self.kv_heads[i]
         qkv = self.cur(b + "qkv", u)
         t0 = time.perf_counter()
         q = rms(qkv[:, : nh * hd].reshape(T, nh, hd), self.p[b + "q_norm"])
@@ -215,6 +222,26 @@ class LFM3:
         q = apply_rope(q, cos, sin) * np.float32(1.0 / np.sqrt(hd))
         st.k[i][:, p0 : p0 + T] = apply_rope(k, cos, sin).transpose(1, 0, 2)
         st.v[i][:, p0 : p0 + T] = qkv[:, (nh + nkv) * hd :].reshape(T, nkv, hd).transpose(1, 0, 2)
+        gate = 1.0 / (1.0 + np.exp(-(u @ self.p[b + "gate"].T)))
+        self.cpu_ms += (time.perf_counter() - t0) * 1e3
+        return q, gate
+
+    def _attend(self, i, kind, st, chunks):
+        """Causal (for swa layers also windowed) attention of a layer's chunks [(q, p0, npu)] over the keys in
+        st: on the NPU, all in one go, where npu and a build covers the chunk, else on the CPU. Returns each
+        chunk's (T, nh, hd)."""
+        window = self.window if kind == "swa" else 0
+        progs = [self.attn.program(p0, window) if npu and self.attn is not None else None for _, p0, npu in chunks]
+        on_npu = [(q, p0, prog) for (q, p0, _), prog in zip(chunks, progs, strict=True) if prog is not None]
+        npu_outs = iter(self.attn.run(st, i, on_npu, window) if on_npu else ())
+        return [
+            next(npu_outs) if prog is not None else self._attend_cpu(i, kind, q, st, p0)
+            for (q, p0, _), prog in zip(chunks, progs, strict=True)
+        ]
+
+    def _attend_cpu(self, i, kind, q, st, p0):
+        t0 = time.perf_counter()
+        T, nh, nkv = q.shape[0], self.nh, self.kv_heads[i]
         lo = max(0, p0 - self.window + 1) if kind == "swa" else 0  # earlier keys are outside every query's window
         rep, K, V = nh // nkv, st.k[i][:, lo : p0 + T], st.v[i][:, lo : p0 + T]  # (nkv, L, hd)
         i_pos, j_pos = p0 + np.arange(T)[:, None], lo + np.arange(K.shape[1])[None, :]
@@ -222,7 +249,7 @@ class LFM3:
         if kind == "swa":
             mask |= (i_pos - j_pos) >= self.window
         add = np.where(mask, np.float32(-np.inf), np.float32(0))
-        o = np.empty((T, nh, hd), np.float32)
+        o = np.empty_like(q)
 
         def head(h):  # query head h reads kv head h // rep; every operand is a BLAS-ready matrix view
             s = q[:, h] @ K[h // rep].T  # (T, L)
@@ -233,17 +260,24 @@ class LFM3:
             o[:, h] = s @ V[h // rep]
 
         list(_threads().map(head, range(nh)))
-        gate = 1.0 / (1.0 + np.exp(-(u @ self.p[b + "gate"].T)))
-        o = (o * gate[:, :, None]).reshape(T, nh * hd)
+        self.cpu_ms += (time.perf_counter() - t0) * 1e3
+        return o
+
+    def _gated_out(self, b, o, gate):
+        """o_proj of the attention output o (T, nh, hd) times its per-head gate."""
+        t0 = time.perf_counter()
+        o = (o * gate[:, :, None]).reshape(o.shape[0], self.nh * self.hd)
         self.cpu_ms += (time.perf_counter() - t0) * 1e3
         return self.cur(b + "o", o)
 
-    def _block(self, b, h, mixer):
-        """One layer around a token mixer (conv or attention): norms, residuals and the SwiGLU FFN."""
+    def _mix_in(self, b, h):
         t0 = time.perf_counter()
         u = rms(h, self.p[b + "attn_norm"])
         self.cpu_ms += (time.perf_counter() - t0) * 1e3
-        o = mixer(u)
+        return u
+
+    def _mix_out(self, b, h, o):
+        """The rest of a layer after its token mixer's output o: norm and residual, then the SwiGLU FFN."""
         t0 = time.perf_counter()
         h = h + rms(o, self.p[b + "post_attention_norm"])
         u = rms(h, self.p[b + "ffn_norm"])
@@ -261,37 +295,56 @@ class LFM3:
         self.cpu_ms += (time.perf_counter() - t0) * 1e3
         return h
 
+    def _block(self, b, h, mixer):
+        """One layer around a token mixer (conv or attention): norms, residuals and the SwiGLU FFN."""
+        return self._mix_out(b, h, mixer(self._mix_in(b, h)))
+
     def forward(self, ids, st: State | None = None, keep_hidden: bool = False, all_logits: bool = False):
         """Prefill `ids` at st.pos (a fresh state if None), in chunks of up to 256 tokens, extending the state.
         Returns (logits of the last position, or of every position if all_logits, and the list of per-layer
-        hidden states if keep_hidden)."""
+        hidden states if keep_hidden).
+
+        Layer by layer: every chunk goes through a layer before the next layer starts. An attention layer runs
+        every chunk's q/k/v, then every chunk's attention, then every chunk's o_proj and FFN, so with attention
+        on the NPU the device switches between the GEMM's and attention's contexts (~1.45 ms each time) twice per
+        layer, not twice per chunk."""
         ids = np.asarray(ids)
         st = st or self.new_state(len(ids))
         if st.pos + len(ids) > st.max_len:
             raise ValueError(f"context full ({st.pos} + {len(ids)} tokens > {st.max_len})")
-        logits, hidden = [], [[] for _ in range(self.n_layers)] if keep_hidden else []
-        for c in range(0, len(ids), CHUNK):
-            chunk = ids[c : c + CHUNK]
-            last = c + CHUNK >= len(ids)
-            self.cur = self.prefill_lin if self.prefill_lin is not None and len(chunk) >= PREFILL_MIN else self.lin
-            try:
-                h = self.embed(chunk)
-                for i in range(self.n_layers):
-                    b, kind = f"blk.{i}.", self.kind(i)
-                    mixer = self._conv if kind == "conv" else partial(self._attn, kind=kind)
-                    h = self._block(b, h, partial(mixer, b, i, st=st))
-                    if keep_hidden:
-                        hidden[i].append(h.copy())
-            finally:
-                self.cur = self.lin
-            st.pos += len(chunk)
-            st.snapshot()
-            if all_logits:
-                logits.append(self.head(h))
-            elif last:
-                logits.append(self.head(h[-1:])[0])
-        hidden = [np.concatenate(parts) for parts in hidden] if keep_hidden else []
-        return (np.concatenate(logits) if all_logits else logits[-1]), hidden
+        chunks = [(st.pos + c, ids[c : c + CHUNK]) for c in range(0, len(ids), CHUNK)]
+        gemm = [self.prefill_lin is not None and len(ch) >= PREFILL_MIN for _, ch in chunks]
+        backends = [self.prefill_lin if g else self.lin for g in gemm]
+        hs = [self.embed(ch) for _, ch in chunks]
+        snaps = [{} for _ in chunks]  # conv windows at each chunk's end
+        hidden = []
+        try:
+            for i in range(self.n_layers):
+                b, kind = f"blk.{i}.", self.kind(i)
+                if kind == "conv":
+                    for j in range(len(chunks)):
+                        self.cur = backends[j]
+                        hs[j] = self._block(b, hs[j], partial(self._conv, b, i, st=st))
+                        snaps[j][i] = st.conv[i].copy()
+                else:
+                    qg = []
+                    for j, (p0, _) in enumerate(chunks):
+                        self.cur = backends[j]
+                        qg.append(self._qkv(b, i, self._mix_in(b, hs[j]), kind, st, p0))
+                    outs = self._attend(i, kind, st, [(qg[j][0], p0, gemm[j]) for j, (p0, _) in enumerate(chunks)])
+                    for j in range(len(chunks)):
+                        self.cur = backends[j]
+                        hs[j] = self._mix_out(b, hs[j], self._gated_out(b, outs[j], qg[j][1]))
+                if keep_hidden:
+                    hidden.append(np.concatenate(hs))
+        finally:
+            self.cur = self.lin
+        for (p0, ch), snap in zip(chunks, snaps, strict=True):
+            st.snaps[p0 + len(ch)] = snap
+        st.pos += len(ids)
+        if all_logits:
+            return np.concatenate([self.head(h) for h in hs]), hidden
+        return self.head(hs[-1][-1:])[0], hidden
 
     # ---- decode
     def new_state(self, max_len: int = 4096) -> State:

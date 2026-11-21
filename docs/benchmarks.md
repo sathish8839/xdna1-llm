@@ -264,11 +264,45 @@ on it. Two contexts in all. Before it, prompts ran on the bf16 GEMM (section 4) 
   | prompt attention on the CPU | 5.9–6.8 s | 4.6–5.9 s |
 
   KLD against the CPU unchanged (0.00003 decode, 0.00005 prompt). At 4K tokens prompt attention is still
-  ~30 % of the prompt and grows fastest: M7's attention design.
+  ~30 % of the prompt and grows fastest: it now runs on the NPU ([3e](#3e-prompt-attention-on-the-npu)).
 * Chunks shorter than 32 tokens stay on the GEMV: the GEMM always computes 256 rows, which takes about as long
   as ~25 single-token steps.
 * The weight cache now holds only the GEMV tiles, 1.2 GB instead of 3.9 GB. Loading Q4_K_M through
   `Engine`: 14.7 s the first time (writing the cache), 8.2 s after, against 57.7 s and 18.5 s with the bf16 copy.
+
+## 3e. Prompt attention on the NPU
+
+`kernels/designs/attn.py` / `attn.cc`, driven by `xdna1_llm.npu.attn`. Each array column is one kv head and its
+4 cores are that head's 4 query heads, so every K / V block is read once per column and broadcast to 4 cores.
+A core takes 32 query rows at a time over 32-key blocks with an online softmax (flash attention): S = Q K^T in
+bf16 `mmul`, the masks from positions in a header, exp2 as a cubic in bf16 MACs (AIE2 has no fp32 multiplier or
+exp), P in bf16, O += P [V | 1] (the ones column gives the softmax sum). O is rescaled only when a row's max
+grows by more than 8 (in log2 units), so most blocks skip it.
+
+* **One context for every length:** the cores do not depend on how many keys a call reads, only the DMA program
+  does, so `attn_<L>` (full attention, L = 256 … 4352 in steps of 256) and `attn_swa` (the 256-key window) are
+  instruction streams on one xclbin. A build takes ~4 s.
+* **Host side:** each conversation keeps a bf16 copy of the K/V cache on the device, extended from the fp32
+  CPU cache before a call (decode steps in between are picked up, `State.rewind` marks the rest stale). Q goes
+  in and O comes out as rows; the memory tiles' DMA tiles and untiles them. The prompt runs layer by layer, so
+  the device switches between the GEMM and attention contexts (~1.45 ms each) twice per attention layer, not
+  twice per chunk, and while one chunk runs the host prepares the next.
+* **Kernel, one 256-row chunk with all 16 heads:** 0.9 ms at 512 keys, 3.9 ms at 2K, 7.4 ms at 4K, 0.8 ms
+  for the sliding window: ~7.4 µs per 32-key block per core. With the compute stubbed out the data movement
+  alone takes 3.1 µs (K / V stream at ~5 GB/s per column); the softmax (2.4 µs) and P · V (1.9 µs) come on
+  top, so the kernel is compute bound.
+* **Accuracy:** against fp64 attention on the same bf16 inputs, 1.7e-3 median error per output row; a numpy
+  emulation shows the bf16 rounding of q, k and v dominates and the exp2 cubic adds nothing beyond rounding P
+  to bf16. `eval_quality.py` (256-token chunks): KLD 0.00006 against the CPU (was 0.00005), 99.86 % same
+  top-1. Over long prompts against CPU attention: KLD 2–5e-4 mean at 1K–4K tokens, 97–98 % same top-1.
+* **Prompt, Q4_K_M, alternating runs against v0.3.0 in the same machine state:**
+
+  | tokens | v0.3.0 | NPU attention | CPU ops |
+  |---|---|---|---|
+  | 1K | 2.93 s (350 tok/s) | **2.74 s (374 tok/s)** | 1.0 → 0.67 s |
+  | 4K | 14.1 s (291 tok/s) | **11.1 s (370 tok/s)** | 6.4 → 2.7 s, plus 0.58 s NPU attention |
+
+  The GEMM calls (7.4 s at 4K) are now two thirds of a long prompt.
 
 ## 4. LFM3-1.7B prefill with linears on the NPU
 

@@ -15,7 +15,7 @@ tokenizes, schedules and samples.
 | M4 | **Q4_K_M** weights: Q4_K / Q6_K repacked at load and dequantized on the NPU | ✅ |
 | M5 | OpenAI-compatible server: `/v1/chat/completions` (SSE streaming, tool calls), `/v1/models` | ✅ |
 | M6 | **v0.1 release:** WinUI 3 app (chat, thinking toggle, DuckDuckGo web search) and an installer with prebuilt kernels | ✅ [v0.1.0](https://github.com/sathish8839/xdna1-llm/releases/tag/v0.1.0) (pre-release), [v0.2.0](https://github.com/sathish8839/xdna1-llm/releases/tag/v0.2.0), [v0.3.0](https://github.com/sathish8839/xdna1-llm/releases/tag/v0.3.0) |
-| M7 | Every op on the NPU: fused per-layer designs (norms, conv, RoPE, attention, SwiGLU) | SwiGLU done (prompts and decode) |
+| M7 | Every op on the NPU: fused per-layer designs (norms, conv, RoPE, attention, SwiGLU) | SwiGLU done (prompts and decode); prompt attention on the NPU |
 | M8 | More context (up to 8K), more small models | Prompts already run in 256-token chunks; past ~1K tokens untested |
 
 M7 is listed after the release on purpose. Linear layers are more than 95% of the FLOPs and nearly all of the
@@ -130,9 +130,11 @@ Per-layer fused designs, one xclbin each (≤ 4 contexts total):
 The hidden state stays in one device buffer across designs. Each design is validated op by op against the numpy
 reference in `xdna1_llm.models.lfm3`, which already matches llama.cpp.
 
-Where things stand: in decode the CPU ops are ~3.5 ms of a ~56 ms token, so M7 matters mostly for prompts, where
-they are 0.8 s of 2.65 s (820 tokens). Prompt attention on the CPU grows with the square of the length, so
-`attn_layer` is likely first; a 4K-token prompt will show how much it dominates.
+Where things stand: in decode the CPU ops are ~3.5 ms of a ~56 ms token, so M7 matters mostly for prompts.
+Prompt attention, which grows with the square of the length, runs on the NPU
+([benchmarks 3e](benchmarks.md#3e-prompt-attention-on-the-npu)): a 4K-token prompt takes 11.1 s instead of
+14.1 s. Left for `attn_layer`: a faster kernel (its softmax and P · V are compute bound), and fusing the
+norms, RoPE and gate around it (2.7 s of CPU ops remain in a 4K prompt). Decode attention stays on the CPU.
 
 ## Open questions
 

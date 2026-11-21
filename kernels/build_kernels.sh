@@ -3,7 +3,7 @@
 #
 #   MLIR_AIE=~/mlir-aie XRT_SDK_WIN=/mnt/c/.../xrt_sdk/xrt ./kernels/build_kernels.sh [out_dir] [set]
 #
-# sets: qgemv (Q4_K + Q6_K decode GEMVs), qgemm (W4A16 prompt GEMMs on the same weights),
+# sets: qgemv (Q4_K + Q6_K decode GEMVs), qgemm (W4A16 prompt GEMMs on the same weights), attn (prompt attention),
 #       engine (default: the bf16 chunk GEMMs, the older prompt path), gemv (bf16 decode GEMVs), bw (streaming probes),
 #       shapes (per-shape GEMM benchmark kernels), smoke, all
 # Requires: an mlir-aie checkout with its ironenv (utils/env_install.sh) and xclbinutil on PATH
@@ -131,6 +131,15 @@ if [[ "$SET" == qgemm || "$SET" == all ]]; then
     design "qm6only_$shape" qgemm.py -Q 6 -N "${shape%x*}" -K "${shape#*x}" --geometry q6only
   done
   design qm6only_15360x2048_glu qgemm.py -Q 6 -N 15360 -K 2048 --geometry q6only --glu
+fi
+if [[ "$SET" == attn || "$SET" == all ]]; then
+  # prompt attention (NpuAttn): the cores do not depend on how many keys a call reads, so one context runs every
+  # build; each key span L (full attention for a chunk starting at up to L - 256) needs its instruction stream,
+  # and so does the sliding window. Spans up to 4352 cover every prompt chunk of a 4096-token context.
+  for L in $(seq 256 256 4352); do
+    design "attn_$L" attn.py --keys "$L"
+  done
+  design attn_swa attn.py --swa
 fi
 if [[ "$SET" == bw || "$SET" == all ]]; then
   for lanes in 1 2 4 8; do

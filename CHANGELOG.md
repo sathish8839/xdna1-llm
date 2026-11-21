@@ -5,6 +5,19 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Prompt attention on the NPU (`kernels/designs/attn.py`, `xdna1_llm.npu.attn`): flash attention on all 16
+  cores, one kv head per array column, one context for every key length (`attn_256` … `attn_4352` and
+  `attn_swa`, the new `attn` set in `build_kernels.sh`). Each conversation keeps a bf16 copy of its KV cache on
+  the device. A 4K-token Q4_K_M prompt takes 11.1 s instead of 14.1 s (291 → 370 tok/s), 1K tokens 2.74 s
+  instead of 2.93 s; KLD against the CPU 0.00006 (was 0.00005). Chunks no build covers fall back to the CPU.
+
+### Changed
+
+- Prompts run layer by layer (every chunk through a layer before the next layer), so the NPU switches between
+  the GEMM and attention contexts twice per attention layer instead of twice per chunk.
+
 ## [0.3.0] - 2026-11-21
 
 Faster on both ends, with the same output. The FFN's SwiGLU now runs on the NPU cores for prompts and for

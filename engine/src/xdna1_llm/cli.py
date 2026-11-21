@@ -18,7 +18,7 @@ import numpy as np
 
 from . import chat
 from .cpu_linear import CpuLinear
-from .engine import gemm_backend
+from .engine import attn_backend, gemm_backend
 from .gguf_weights import GGUFWeights
 from .models.lfm3 import LFM3
 from .reference import LlamaServer
@@ -149,9 +149,10 @@ def generate(a, w, tok, srv, ids):
 
         lin = NpuQLinear(kernel_dir=a.kernels, formats=w.types())
         prefill_lin = None if a.no_gemm_prompt else gemm_backend(lin)
+        attn = attn_backend(lin) if prefill_lin is not None else None
     else:
-        lin, prefill_lin = CpuLinear(), None
-    m = LFM3(w, lin, prefill_lin)
+        lin, prefill_lin, attn = CpuLinear(), None, None
+    m = LFM3(w, lin, prefill_lin, attn)
     repack = f" (repack {lin.repack_s:.1f} s, {lin.geo.name} tiles)" if a.backend == "npu" else ""
     prompt_on = {"NpuQGemm": "W4A16 GEMM", "NpuLinear": "bf16 GEMM"}.get(type(prefill_lin).__name__, "decode GEMV")
     print(

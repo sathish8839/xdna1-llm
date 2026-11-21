@@ -75,12 +75,12 @@ def evaluate():
     first = list(variants)[1]
     pairs = [(v, "bf16") for v in variants]
     if a.npu:
-        from xdna1_llm.engine import gemm_backend
+        from xdna1_llm.engine import attn_backend, gemm_backend
         from xdna1_llm.npu.qlinear import NpuQLinear  # imports pyxrt
 
         w = variants[first][0].w
         qlin = NpuQLinear(kernel_dir=a.kernels, formats=w.types())
-        m = LFM3(w, qlin, gemm_backend(qlin))  # step() uses the GEMV, forward() the GEMM
+        m = LFM3(w, qlin, gemm_backend(qlin), attn_backend(qlin))  # step(): the GEMV; forward(): GEMM, NPU attention
         variants[first + "-npu"] = (m, decode_logits)
         variants[first + "-gemm"] = (m, prefill_logits)
         pairs += [(v, ref) for v in (first + "-npu", first + "-gemm") for ref in ("bf16", first)]

@@ -57,6 +57,13 @@ def gemm_backend(qlin, cache=None):
     return None
 
 
+def attn_backend(qlin):
+    """Prompt attention on qlin's device if it is built, else None (it then runs on the CPU)."""
+    from .npu.attn import NpuAttn, spans
+
+    return NpuAttn(qlin.npu, qlin.kdir) if spans(qlin.kdir) else None
+
+
 class Engine:
     def __init__(
         self, model, tok: Tokenizer, name: str, ctx: int = 4096, w=None, thinking: bool = False, device: str = "CPU"
@@ -86,7 +93,8 @@ class Engine:
 
             cache = WeightCache.for_model(gguf) if weight_cache else None
             lin = NpuQLinear(kernel_dir=kernels, formats=w.types(), cache=cache)
-            model = LFM3(w, lin, gemm_backend(lin, cache) if gemm_prompt else None)
+            prefill = gemm_backend(lin, cache) if gemm_prompt else None
+            model = LFM3(w, lin, prefill, attn_backend(lin) if prefill is not None else None)
             kw.setdefault("device", lin.npu.name)
         else:
             model = LFM3(w, CpuLinear())
